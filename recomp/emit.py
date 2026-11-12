@@ -25,11 +25,20 @@ own.  The ROM's bytes being known, a fetch is only its charge.
 * HALT is the runtime's; when it leaves the next opcode already fetched
   (IME clear) the interpreter runs the next instruction.
 
+The RAM region (`rram`: the OAM DMA routine in HRAM, code copied to WRAM)
+is written the same way from the bytes the trace saw it run with, and holds
+while RAM holds them, routine by routine (the instructions joined by
+control flow): `rram_ok_N` compares routine N's, the runtime before
+entering, the code at its slow polls (GB_POLLR), after a call and after a
+write that may reach them -- or SVBK, which maps another WRAM bank at
+$D000.  Where they changed, the interpreter goes on.
+
 A region becomes several C++ functions of at most CHUNK_MAX instructions,
 cut where the fewest jumps cross (g++ is superlinear in a function's size);
 a jump between them is a continuation.
 """
 from .. import sm83
+from .discover import RAM
 
 R8 = ['c.B', 'c.C', 'c.D', 'c.E', 'c.H', 'c.L', None, 'c.A']
 RR_GET = ['GB_BC(c)', 'GB_DE(c)', 'GB_HL(c)', 'c.SP']
@@ -55,6 +64,11 @@ class Emitter:
     def __init__(self, prog, r, comments=True):
         self.p, self.r, self.comments = prog, r, comments
         self.sites = {}
+        self.comp = r.components() if r.win == RAM else {}
+        ncomp = max(self.comp.values(), default=-1) + 1
+        self.runs = [r.runs([a for a in r.code if self.comp[a] == n]) for n in range(ncomp)]
+        self.guarded = [{a + k for a, b in rs for k in range(len(b))} for rs in self.runs]
+        self.cur_a = None
         self._chunk()
 
     def _chunk(self):
@@ -65,7 +79,7 @@ class Emitter:
         for n, a in enumerate(order):
             i = r.code[a]
             outs = []
-            if i.kind in ('jump', 'branch') and i.target is not None:
+            if i.kind in ('jump', 'branch') and i.target is not None and not self._var(a):
                 outs.append(i.target)
             outs += r.indirect.get(a, [])
             outs += sorted(r.alt_ret.get(i.next, ()))
@@ -123,8 +137,10 @@ class Emitter:
         return f'gb_call(c, {h(t)}); return;'
 
     def _bank_ok(self, nxt):
-        """Leave (the interpreter going on from nxt) if the bank under the code changed."""
+        """Leave (the interpreter going on from nxt) if the bank under the code changed (in RAM: its bytes)."""
         r = self.r
+        if r.win == RAM:
+            return f' if (!{self.guard_name(self.cur_a)}(c)) {{ gb_call(c, {h(nxt)}); return; }}'
         return f' if (c.{"bankx" if r.win else "bank0"} != {h(r.bank, 3)}) {{ gb_call(c, {h(nxt)}); return; }}'
 
     def _callee(self, t):
@@ -150,19 +166,67 @@ class Emitter:
                + self._bank_ok(nxt)
 
     def _wr_check(self, addr_const, nxt):
-        """After a write: the mapper may have switched the bank, unless the address is fixed and past ROM."""
+        """After a write: the mapper may have switched the bank, unless the address is fixed and past ROM.
+        In RAM: the write may have reached the code's bytes, or SVBK."""
+        if self.r.win == RAM:
+            own = self.guarded[self.comp[self.cur_a]]
+            if addr_const is not None and addr_const not in own and addr_const != 0xFF70 \
+                    and (addr_const - 0x2000) not in own:
+                return ''
+            return self._bank_ok(nxt)
         if addr_const is not None and addr_const >= 0x8000:
             return ''
         return self._bank_ok(nxt)
 
+    def _var(self, a):
+        """The offsets of the operand bytes of the instruction at a that change as the code runs (RAM)."""
+        return getattr(self.r, 'varops', {}).get(a, ())
+
+    def _dyn(self, a, t_expr, call=None):
+        """A jump (call: the return address) to a target an operand that changes makes: a switch over the
+        targets the trace saw, gb_call for the rest."""
+        self._count('patched target')
+        if call is None:
+            cases = ' '.join(f'case {h(t)}: {self._jmp(t)}' for t in self.r.indirect.get(a, []) if self._local(t))
+            return f'{{ const uint16_t t = {t_expr}; switch (t) {{ {cases} default: gb_call(c, t); return; }} }}'
+        nxt = call
+        alts = sorted(x for x in self.r.alt_ret.get(nxt, ()) if self._local(x))
+        back = f'if (c.resume != {h(nxt)} || c.SP != s0) {{ '
+        if alts:
+            back += f'if (c.SP == s0) switch (c.resume) {{ ' + ' '.join(f'case {h(x)}: {self._jmp(x)}' for x in alts) \
+                    + ' default: break; } '
+        back += 'return; }'
+        return (f'{{ const uint16_t t = {t_expr}; gb_push(c, {h(nxt)}); {{ const uint16_t s0 = (uint16_t)(c.SP + 2); '
+                f'gb_call(c, t); {back} }} }}' + self._bank_ok(nxt))
+
     def insn(self, a):
-        """(C++ text, whether control goes on to the next instruction)."""
+        """(C++ text, whether control goes on to the next instruction).  An instruction in RAM whose operands
+        change reads them from RAM (into o1, o2) as it runs."""
+        var = self._var(a)
+        text, on = self._insn(a)
+        if var:
+            loads = ' '.join(f'const uint8_t o{k} = gb_ram_byte(c, {h(a + k)});' for k in var)
+            text = f'{{ {loads} {text} }}'
+        return text, on
+
+    def guard_name(self, a):
+        """The guard of the RAM routine holding the instruction at a."""
+        return f'rram_ok_{self.comp[a]}'
+
+    def _insn(self, a):
         r = self.r
+        self.cur_a = a
         i = r.code[a]
         op, n, nxt = i.op, i.length, i.next
         raw = i.raw
         i8 = raw[1] if n >= 2 else 0
         i16 = raw[1] | raw[2] << 8 if n == 3 else 0
+        var = self._var(a)
+        B1 = 'o1' if 1 in var else h(raw[1], 2) if n >= 2 else None
+        B2 = 'o2' if 2 in var else h(raw[2], 2) if n >= 3 else None
+        I8 = B1
+        I16 = f'(uint16_t)({B1} | {B2} << 8)' if var and n == 3 else h(i16)
+        V = bool(var)
         x, y, z = op >> 6, (op >> 3) & 7, op & 7
         F = T(n) if op < 0x100 else ''
 
@@ -200,7 +264,7 @@ class Emitter:
         if op == 0x00:
             return f'{F}', True
         if op in (0x01, 0x11, 0x21, 0x31):
-            return f'{F}' + RR_SET[op >> 4].format(h(i16)) + ';', True
+            return f'{F}' + RR_SET[op >> 4].format(I16) + ';', True
         if op in (0x02, 0x12):
             return f'{F}gb_wr(c, {RR_GET[op >> 4]}, c.A);' + self._bank_ok(nxt), True
         if op == 0x22:
@@ -233,8 +297,8 @@ class Emitter:
                     + self._bank_ok(nxt)), True
         if x == 0 and z == 6:
             if y == 6:
-                return f'{F}gb_wr(c, GB_HL(c), {h(i8, 2)});' + self._bank_ok(nxt), True
-            return f'{F}{R8[y]} = {h(i8, 2)};', True
+                return f'{F}gb_wr(c, GB_HL(c), {I8});' + self._bank_ok(nxt), True
+            return f'{F}{R8[y]} = {I8};', True
         if op == 0x07:
             return f'{F}c.A = (uint8_t)(c.A << 1 | c.A >> 7); c.F = (c.A & 1) ? FC : 0;', True
         if op == 0x0F:
@@ -252,11 +316,24 @@ class Emitter:
         if op == 0x3F:
             return f'{F}c.F = (uint8_t)((c.F & FZ) | ((c.F & FC) ? 0 : FC));', True
         if op == 0x08:
+            if V:
+                return (f'{F}{{ const uint16_t ad = {I16}; gb_wr(c, ad, (uint8_t)c.SP); '
+                        f'gb_wr(c, (uint16_t)(ad + 1), (uint8_t)(c.SP >> 8)); }}' + self._wr_check(None, nxt)), True
             return (f'{F}gb_wr(c, {h(i16)}, (uint8_t)c.SP); gb_wr(c, {h((i16 + 1) & 0xFFFF)}, (uint8_t)(c.SP >> 8));'
                     + self._wr_check(i16 if i16 < 0xFFFF else None, nxt)), True
         if op == 0x10:
             self._count('stop')
             return f'{T(2)}gb_stop(c);', True
+        if V and op in (0x18, 0x20, 0x28, 0x30, 0x38, 0xC3, 0xC2, 0xCA, 0xD2, 0xDA):
+            te = f'(uint16_t)({h(nxt)} + (int8_t){I8})' if op < 0x40 else I16
+            if op in (0x18, 0xC3):
+                return f'{F}gb_tick(c, 4); {self._dyn(a, te)}', False
+            return f'{F}if ({COND[(op >> 3) & 3]}) {{ gb_tick(c, 4); {self._dyn(a, te)} }}', True
+        if V and op in (0xCD, 0xC4, 0xCC, 0xD4, 0xDC):
+            self._count('call')
+            if op == 0xCD:
+                return f'{F}gb_tick(c, 4); {self._dyn(a, I16, nxt)}', True
+            return f'{F}if ({COND[(op >> 3) & 3]}) {{ gb_tick(c, 4); {self._dyn(a, I16, nxt)} }}', True
         if op == 0x18 or op == 0xC3:
             return f'{F}gb_tick(c, 4); {self._goto(i.target)}', False
         if op in (0x20, 0x28, 0x30, 0x38, 0xC2, 0xCA, 0xD2, 0xDA):
@@ -293,15 +370,23 @@ class Emitter:
         if op == 0xF5:
             return f'{F}gb_tick(c, 4); c.F &= 0xF0; gb_push(c, (uint16_t)(c.A << 8 | c.F));', True
         if x == 3 and z == 6:
-            return f'{F}{ALU[y]}(c, {h(i8, 2)});', True
+            return f'{F}{ALU[y]}(c, {I8});', True
+        if op == 0xE0 and V:
+            return f'{F}gb_wr(c, (uint16_t)(0xFF00 | {I8}), c.A);' + self._wr_check(None, nxt), True
+        if op == 0xF0 and V:
+            return f'{F}c.A = gb_rd(c, (uint16_t)(0xFF00 | {I8}));', True
         if op == 0xE0:
-            return f'{F}gb_wr(c, {h(0xFF00 | i8)}, c.A);', True
+            return f'{F}gb_wr(c, {h(0xFF00 | i8)}, c.A);' + (self._wr_check(0xFF00 | i8, nxt) if r.win == RAM else ''), True
         if op == 0xF0:
             return f'{F}c.A = gb_rd(c, {h(0xFF00 | i8)});', True
         if op == 0xE2:
-            return f'{F}gb_wr(c, (uint16_t)(0xFF00 | c.C), c.A);', True
+            return f'{F}gb_wr(c, (uint16_t)(0xFF00 | c.C), c.A);' + (self._wr_check(None, nxt) if r.win == RAM else ''), True
         if op == 0xF2:
             return f'{F}c.A = gb_rd(c, (uint16_t)(0xFF00 | c.C));', True
+        if op == 0xEA and V:
+            return f'{F}gb_wr(c, {I16}, c.A);' + self._wr_check(None, nxt), True
+        if op == 0xFA and V:
+            return f'{F}c.A = gb_rd(c, {I16});', True
         if op == 0xEA:
             if i16 < 0x8000:
                 self._count('mapper write')
@@ -309,9 +394,9 @@ class Emitter:
         if op == 0xFA:
             return f'{F}c.A = gb_rd(c, {h(i16)});', True
         if op == 0xE8:
-            return f'{F}c.SP = gb_spe(c, {h(i8, 2)}); gb_tick(c, 8);', True
+            return f'{F}c.SP = gb_spe(c, {I8}); gb_tick(c, 8);', True
         if op == 0xF8:
-            return f'{F}gb_sethl(c, gb_spe(c, {h(i8, 2)})); gb_tick(c, 4);', True
+            return f'{F}gb_sethl(c, gb_spe(c, {I8})); gb_tick(c, 4);', True
         if op == 0xF9:
             return f'{F}c.SP = GB_HL(c); gb_tick(c, 4);', True
         if op == 0xF3:
@@ -319,6 +404,26 @@ class Emitter:
         if op == 0xFB:
             return f'{F}gb_ei(c);', True
         raise ValueError(f'{a:04X}: {i.text()}')
+
+    def guards(self):
+        """The guard names, one a RAM routine."""
+        return [f'rram_ok_{n}' for n in range(len(self.runs))]
+
+    def guard(self):
+        """rram_ok_N: RAM holds the bytes RAM routine N was compiled from."""
+        lines = []
+        for g, runs in zip(self.guards(), self.runs):
+            lines.append(f'bool {g}(const GB& c) {{')
+            for n, (a, b) in enumerate(runs):
+                lines.append(f'    static const uint8_t b{n}[{len(b)}] = {{ ' + ', '.join(h(x, 2) for x in b) + ' };')
+            tests = []
+            for n, (a, b) in enumerate(runs):
+                base = f'c.hram + {h(a - 0xFF80, 2)}' if a >= 0xFF80 else f'c.rd_pg[{h(a >> 12, 1)}] + {h(a & 0xFFF, 3)}'
+                tests.append(f'std::memcmp({base}, b{n}, {len(b)}) == 0')
+            lines.append('    return ' + ('\n        && '.join(tests) or 'true') + ';')
+            lines.append('}')
+            lines.append('')
+        return lines
 
     def emit(self):
         r = self.r
@@ -330,14 +435,15 @@ class Emitter:
                 text, on = self.insn(a)
                 if self.comments:
                     text += f'  // {a:04X} {r.code[a].text()}'
-                body.append(f'L_{a:04X}: GB_POLL(c, {h(a)}, {r.win}, {h(r.bank, 3)});')
+                body.append(f'L_{a:04X}: GB_POLLR(c, {h(a)}, {self.guard_name(a)});' if r.win == RAM else
+                            f'L_{a:04X}: GB_POLL(c, {h(a)}, {r.win}, {h(r.bank, 3)});')
                 body.append('    ' + text)
                 nxt = r.code[a].next
                 following = ips[n + 1] if n + 1 < len(ips) else None
                 if on and nxt != following:
                     body.append('    ' + self._goto(nxt))
             bodies.append(body)
-        lines = []
+        lines = self.guard() if r.win == RAM else []
         self.funcs = []
         for k, body in enumerate(bodies):
             ways = sorted(self.ways[k])

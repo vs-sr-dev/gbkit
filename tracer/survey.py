@@ -54,6 +54,8 @@ def parse(rep):
         if toks[0] == 'where':
             r.setdefault('where', []).append(dict(win=int(toks[2]), bank=int(toks[4], 16), insns=int(toks[6])))
             continue
+        if toks[0] in ('ramcode', 'site'):
+            continue
         if toks[0] == 'bank':
             r.setdefault('banks', []).append(dict(zip(toks[2::2], toks[3::2])) | {'n': int(toks[1], 16)})
             continue

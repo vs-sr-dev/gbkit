@@ -14,7 +14,7 @@
 //   --mbc NAME --ram BYTES --battery --rtc   what gbkit/cart.py knows (MAME's lists)
 //   --serial                        print what the game sent on the serial port (the test ROMs)
 //   --regs                          the CPU's registers at the end (mooneye's verdict)
-//   --peek ADDR:N                   N bytes from ADDR at the end, as the CPU reads them (blargg's $A000)
+//   --peek ADDR:N                   N bytes from ADDR at the end, as the CPU reads them (blargg's $A000; repeatable)
 //   --state                         the PPU's and the ports' state at the end
 //   --profile                       where the interpreter ran under native code
 //
@@ -72,7 +72,8 @@ static uint8_t monkey(long f) {
 }
 
 struct Opts {
-    std::string rom, out = ".", wav, trace, record, replay, mbc, peek;
+    std::string rom, out = ".", wav, trace, record, replay, mbc;
+    std::vector<std::string> peek;
     long frames = 6000;
     bool interp = false, lockstep = false, window = false, quiet = false, rtc = false, battery = false;
     bool serial = false, regs = false, state = false, hist = false;
@@ -265,7 +266,7 @@ int main(int argc, char** argv) {
         else if (a == "--state") O.state = true;
         else if (a == "--regs") O.regs = true;
         else if (a == "--serial") O.serial = true;
-        else if (a == "--peek") O.peek = val();
+        else if (a == "--peek") O.peek.push_back(val());
         else if (a == "--window") O.window = true;
         else if (a == "--quiet") O.quiet = true;
         else if (a == "--profile") { static uint32_t prof[512 * 0x10000]; g_prof = prof; }
@@ -376,9 +377,9 @@ int main(int argc, char** argv) {
     if (O.regs)
         std::printf("regs A=%02X F=%02X B=%02X C=%02X D=%02X E=%02X H=%02X L=%02X SP=%04X PC=%04X\n",
                     c.A, c.F, c.B, c.C, c.D, c.E, c.H, c.L, c.SP, c.PC);
-    if (!O.peek.empty()) {
-        unsigned long a = std::strtoul(O.peek.c_str(), nullptr, 16), n = 1;
-        size_t k = O.peek.find(':'); if (k != std::string::npos) n = std::strtoul(O.peek.c_str() + k + 1, nullptr, 10);
+    for (const std::string& pk : O.peek) {
+        unsigned long a = std::strtoul(pk.c_str(), nullptr, 16), n = 1;
+        size_t k = pk.find(':'); if (k != std::string::npos) n = std::strtoul(pk.c_str() + k + 1, nullptr, 10);
         std::printf("peek %04lX:", a);
         for (unsigned long i = 0; i < n; i++) std::printf(" %02X", gb_peek(c, (uint16_t)(a + i)));
         std::printf("\n");

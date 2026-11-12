@@ -44,23 +44,26 @@ def _plausible(prog, w, bank, a):
     return d[o] != 0xFF                        # RST $38: the padding of an empty ROM
 
 
-def _grow(prog, base, n0, n1, stride, entry_at):
-    """Entries of a table at ROM offset base (n0..n1 already known good), grown both ways."""
+def _grow(prog, base, n0, n1, stride, entry_at, kind='word'):
+    """Entries of a table at ROM offset base (n0..n1 already known good), grown both ways.  The table's
+    span goes to prog.table_spans (when the program keeps one)."""
     out = []
     k = n0 - 1
-    while k >= 0 and n1 - k < MAX:
+    while n1 - k < MAX:                       # before the first traced entry (k < 0: before base)
         e = entry_at(base + k * stride)
         if e is None:
             break
         out.append(e)
         k -= 1
+    first = k + 1
     k = n1 + 1
-    while k - n0 < MAX:
+    while k - first < MAX:
         e = entry_at(base + k * stride)
         if e is None:
             break
         out.append(e)
         k += 1
+    _span(prog, kind, base, first, k - 1, stride)
     return out
 
 
@@ -98,9 +101,15 @@ def word_tables(prog, sites):
                     n1 = 0
                     while o + 2 * (n1 + 1) in pos:
                         n1 += 1
-                    for e in _grow(prog, o, 0, n1, 2, entry_at):
+                    for e in _grow(prog, o, 0, n1, 2, entry_at, 'word'):
                         found.add(e)
     return found
+
+
+def _span(prog, kind, base, first, last, stride):
+    spans = getattr(prog, 'table_spans', None)
+    if spans is not None:
+        spans.append((kind, base + first * stride, last - first + 1, stride))
 
 
 def bank_tables(prog, targets):
@@ -129,6 +138,6 @@ def bank_tables(prog, targets):
             if b == 0 or b >= prog.banks:
                 return None
             return (1, b, a) if _plausible(prog, 1, b, a) else None
-        for e in _grow(prog, o, 0, n1, 3, entry_at):
+        for e in _grow(prog, o, 0, n1, 3, entry_at, 'bank'):
             found.add(e)
     return found

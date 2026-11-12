@@ -6,10 +6,15 @@ way it reports.
 TESTDIR holds the suites as they are downloaded (not distributed with gbkit):
 
     blargg/gb-test-roms-master/   blargg's: the verdict on the serial port ("Passed"),
-                                  or at $A000 (0 after the signature DE B0 61 at $A001)
+                                  at $A000 (0 after the signature DE B0 61 at $A001),
+                                  or on the screen alone (halt_bug, interrupt_time: the
+                                  text is in the BG map, a tile per ASCII code)
     mooneye/*/                    Gekkio's mooneye test suite: registers B C D E H L =
                                   3 5 8 13 21 34 for a pass; the model from the name's
-                                  suffix (C: a CGB; G, dmgABC or none: a DMG)
+                                  suffix (C: a CGB; G, dmgABC or none: a DMG).  A test for a
+                                  CGB in a cartridge with no CGB flag is for the CGB's
+                                  compatibility mode, which gbkit does not run (a DMG game
+                                  runs as a DMG): skipped and counted apart
     dmg-acid2.gb, cgb-acid2.gbc   Matt Currie's: the picture against the reference
                                   (dmg-acid2-ref.png, cgb-acid2-ref.png)
 """
@@ -45,12 +50,14 @@ def tests(root):
     for p in sorted(glob.glob(os.path.join(b, '**', '*.gb'), recursive=True)):
         rel = os.path.relpath(p, b).replace('\\', '/')
         model = 'cgb' if rel.startswith(('cgb_sound', 'interrupt_time')) else 'dmg'
-        out.append(('blargg/' + rel, p, model, 'blargg', 3000))
+        out.append(('blargg/' + rel, p, model, 'blargg', 6000))
     for p in sorted(glob.glob(os.path.join(root, 'mooneye', '*', '**', '*.gb'), recursive=True)):
         rel = os.path.relpath(p, os.path.join(root, 'mooneye')).replace('\\', '/').split('/', 1)[1]
         if rel.startswith(('manual-only', 'utils', 'madness')):
             continue
         model = mooneye_model(os.path.basename(p))
+        if model == 'cgb' and not open(p, 'rb').read()[0x143] & 0x80:
+            model = 'compat'
         if model:
             out.append(('mooneye/' + rel, p, model, 'mooneye', 600))
     for n, model in (('dmg-acid2.gb', 'dmg'), ('cgb-acid2.gbc', 'cgb')):
@@ -90,7 +97,7 @@ def run(exe, t, root):
     with tempfile.TemporaryDirectory() as d:
         cmd = [exe, path, '--interp', '--frames', str(frames), '--quiet', '--out', d, f'--{model}']
         if kind == 'blargg':
-            cmd += ['--serial', '--peek', 'A000:4']
+            cmd += ['--serial', '--peek', 'A000:4', '--peek', '9800:576']
         if kind == 'mooneye':
             cmd += ['--regs']
         try:
@@ -107,6 +114,15 @@ def run(exe, t, root):
             if pk and pk.group(2, 3, 4) == ('DE', 'B0', '61'):
                 code = int(pk.group(1), 16)
                 return name, model, code == 0, '' if code == 0 else f'result {code:02X}'
+            bg = re.search(r'peek 9800: ((?:\w\w ?){576})', o)
+            if bg:
+                b = bytes(int(x, 16) for x in bg.group(1).split())
+                text = ' '.join(''.join(chr(c) if 32 <= c < 127 else ' ' for c in b[r * 32:r * 32 + 20]).strip()
+                                for r in range(18))
+                if 'Passed' in text:
+                    return name, model, True, ''
+                if 'Failed' in text:
+                    return name, model, False, 'screen: ' + ' '.join(text.split())[-60:]
             return name, model, False, ('serial: ' + ' '.join(ser.split())[-60:]) if ser.strip() else 'no verdict'
         if kind == 'mooneye':
             m = re.search(r'regs A=\w\w F=\w\w B=(\w\w) C=(\w\w) D=(\w\w) E=(\w\w) H=(\w\w) L=(\w\w)', o)
@@ -126,6 +142,8 @@ def main(argv=None):
     ap.add_argument('--failed', action='store_true', help='list only the failures')
     a = ap.parse_args(argv)
     ts = [t for t in tests(a.root) if not a.only or a.only in t[0]]
+    compat = [t for t in ts if t[2] == 'compat']
+    ts = [t for t in ts if t[2] != 'compat']
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as ex:
         res = list(ex.map(lambda t: run(a.exe, t, a.root), ts))
     per = {}
@@ -135,7 +153,11 @@ def main(argv=None):
         p[0] += ok; p[1] += 1
         if not ok or not a.failed:
             print(f'{"pass" if ok else "FAIL"}  {model}  {name}  {why}')
-    print('  '.join(f'{k} {v[0]}/{v[1]}' for k, v in sorted(per.items())))
+    for t in compat:
+        if not a.failed:
+            print(f'skip  cgb  {t[0]}  a DMG cartridge on a CGB (compatibility mode)')
+    print('  '.join(f'{k} {v[0]}/{v[1]}' for k, v in sorted(per.items()))
+          + (f"  ({len(compat)} for the CGB's compatibility mode skipped)" if compat else ''))
     return 0
 
 

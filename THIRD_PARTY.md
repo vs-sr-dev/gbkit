@@ -30,6 +30,9 @@ Where gbkit departs from MAME on purpose:
 - the CGB's speed switch pauses the CPU for 2050 M-cycles (Pan Docs; MAME's
   is about 1.4 seconds), both ways;
 - a general HDMA leaves HDMA5 at $FF (MAME's decrements it once more);
+- the serial clock starts in phase with the divider DIV shows, as on the
+  hardware, where it is one of the divider's bits (MAME counts it apart,
+  8 cycles behind);
 - the LCD's timing follows MAME's first engine (its state machine's
   durations) in a state machine of gbkit's own; a line is drawn whole as
   mode 3 begins;
@@ -38,7 +41,9 @@ Where gbkit departs from MAME on purpose:
 
 The state the boot ROM leaves (the boot ROM is not run): the registers
 the Pan Docs give for each model (A = $01 on the DMG, $11 on the CGB -- what
-games read to tell the CGB), SP = $FFFE, PC = $0100, the LCD on.
+games read to tell the CGB), SP = $FFFE, PC = $0100, the LCD on, DIV
+and the serial clock where the boot ROM leaves them, the sound as its
+chime leaves it (channel 1 still on, run down to silence: NR52 reads $F1).
 
 Test ROMs, used locally as the interpreter's regression battery
 (`tools/testroms.py`) and not distributed: blargg's Game Boy test ROMs

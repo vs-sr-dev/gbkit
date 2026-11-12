@@ -23,8 +23,19 @@ at RET and RETI, at undefined opcodes -- the sign of a walk into data -- and
 at a transfer out of the window: where that goes depends on the bank at run
 time, so it goes through `gb_call`, which finds the native code for what is
 mapped then, or interprets.  An instruction that runs over the end of its
-window stops the walk too.  Code in RAM (the OAM DMA routine in HRAM, the
-odd routine in WRAM) stays interpreted.
+window stops the walk too.
+
+Code in RAM -- the OAM DMA routine nearly every game copies to HRAM, the
+routines some copy to WRAM -- is one more region, `rram`, made of the bytes
+the trace saw each instruction there run with: the instructions that ran
+with one version of their bytes, and those whose versions differ in their
+operands only (code that patches its own constants and jump targets as it
+runs: the operands are read from RAM when the instruction runs, and a
+jump's or call's targets are the ones the trace saw it take).  Code whose
+opcodes change stays interpreted.  The rest is valid while RAM holds the
+bytes it was compiled from: the runtime checks them before it enters (and
+at the slow polls, and after a write that may reach them), and interprets
+otherwise.
 
 Entries: the reset ($0100 in bank 0), and from a trace (tracer/gbtrace
 output) every address that was the target of a jump, a call, an interrupt or
@@ -54,6 +65,12 @@ from .. import sm83
 
 R_OP, R_ARG, R_READ, R_JTGT, R_RET = 1, 2, 4, 8, 16
 BANK = 0x4000
+RAM = 2                   # the window of the RAM region
+
+
+def ram_ok(a):
+    """Where compiled RAM code may be: WRAM ($C000-$DFFF) and HRAM ($FF80-$FFFE)."""
+    return 0xC000 <= a < 0xE000 or 0xFF80 <= a < 0xFFFF
 
 
 class Region:
@@ -84,15 +101,84 @@ class Region:
     def contains(self, a):
         return (a >> 14) == self.win
 
+    def holds(self, a, n):
+        """The n bytes from a are all this region's to read."""
+        return (a + n - 1) >> 14 == self.win
+
+
+class RamRegion(Region):
+    """The code in RAM, as the bytes it ran with: valid while RAM holds them (the operands that changed
+    as it ran excepted: read when the instruction runs)."""
+    __slots__ = ('image', 'var', 'varops')
+
+    def __init__(self, image, var=()):
+        super().__init__(RAM, 0)
+        self.image = image        # address -> byte (the opcodes, and the operands that never changed)
+        self.var = set(var)       # the operand bytes that changed
+        self.varops = {}          # address of an instruction -> [offsets of its operand bytes that change]
+
+    @property
+    def name(self):
+        return 'rram'
+
+    def contains(self, a):
+        return a in self.image
+
+    def holds(self, a, n):
+        return a + n - 1 <= 0xFFFF and a in self.image and all(
+            (a + k) in self.image or (a + k) in self.var for k in range(1, n))
+
+    def components(self):
+        """The routines in RAM: the instructions joined by falling through, jumping or calling, as
+        {address: n} (n from 0, by the lowest address).  Each holds while its own bytes do: the OAM DMA
+        routine copied at the reset is not held back by a routine copied next to it later."""
+        up = {a: a for a in self.code}
+
+        def find(a):
+            while up[a] != a:
+                up[a] = up[up[a]]
+                a = up[a]
+            return a
+
+        def join(a, b):
+            if b in up:
+                up[find(a)] = find(b)
+        for a, i in self.code.items():
+            if not i.ends:
+                join(a, i.next)
+            if i.target is not None:
+                join(a, i.target)
+            for t in self.indirect.get(a, ()):
+                join(a, t)
+            for t in self.alt_ret.get(i.next, ()):
+                join(a, t)
+        roots = {}
+        for a in sorted(self.code):
+            roots.setdefault(find(a), len(roots))
+        return {a: roots[find(a)] for a in self.code}
+
+    def runs(self, addrs=None):
+        """The bytes the code (or the instructions at addrs) reads as its own: [(start, bytes)] in address
+        order, a run within a 4 KB page."""
+        code = self.code if addrs is None else {a: self.code[a] for a in addrs}
+        used = sorted({a + k for a, i in code.items() for k in range(i.length) if (a + k) in self.image})
+        out = []
+        for a in used:
+            if out and out[-1][0] + len(out[-1][1]) == a and (a & 0xF000) == (out[-1][0] & 0xF000):
+                out[-1][1].append(self.image[a])
+            else:
+                out.append((a, [self.image[a]]))
+        return [(a, bytes(b)) for a, b in out]
+
 
 def _parse_loc(s):
-    """'BBB:AAAA' -> (window, bank, address); 'RAM:AAAA' -> (None, None, address)."""
+    """'BBB:AAAA' -> (window, bank, address); 'RAM:AAAA' -> (RAM, 0, address)."""
     m = re.match(r'(RAM|[0-9A-F]+):([0-9A-F]{4})', s)
     if not m:
         return None
     a = int(m.group(2), 16)
     if m.group(1) == 'RAM' or a >= 0x8000:
-        return None, None, a
+        return RAM, 0, a
     return a >> 14, int(m.group(1), 16), a
 
 
@@ -119,6 +205,9 @@ class Trace:
         self.pushret = {}         # (win, bank, addr) of a RET no call pushed for -> {(win, bank, addr)}
         self.alt = {}             # (win, bank, addr) a call pushed -> {(win, bank, addr) its caller went on at}
         self.targets = set()      # every traced target in ROM
+        self.ram_targets = set()  # ... and in RAM
+        self.ramcode = {}         # address in RAM -> {the bytes of the instruction run there} ('*...': too many)
+        self.ram_edges = {}       # address in RAM of a jump or call -> {(win, bank, addr) it went to}
         cov = None
         for path in paths:
             c = open(os.path.join(path, 'cov.bin'), 'rb').read()
@@ -131,24 +220,77 @@ class Trace:
             self.where.setdefault(int(w), set()).add(int(b, 16))
         for k, s, d in re.findall(r'^edge (\w) (\S+) -> (\S+) x\d+', rep, re.M):
             to = _parse_loc(d)
-            if not to or to[0] is None:
+            if not to:
                 continue
-            self.targets.add(to)
+            if to[0] == RAM:
+                self.ram_targets.add(to[2])
+            else:
+                self.targets.add(to)
             fr = _parse_loc(s)
-            if k == 'i' and fr and fr[0] is not None:
+            if not fr:
+                continue
+            if k == 'i':
                 self.ind.setdefault(fr, set()).add(to)
-            if k in 'ra' and fr and fr[0] is not None:
+            if k in 'ra':
                 self.alt.setdefault(fr, set()).add(to)
-            if k == 'p' and fr and fr[0] is not None:
+            if k == 'p' and fr[0] != RAM and to[0] != RAM:
                 self.pushret.setdefault(fr, set()).add(to)
+            if k in 'jc' and fr[0] == RAM:
+                self.ram_edges.setdefault(fr[2], set()).add(to)
+        for a, vs in re.findall(r'^ramcode ([0-9A-F]{4}) (.*)$', rep, re.M):
+            have = self.ramcode.setdefault(int(a, 16), set())
+            for v in vs.split():
+                have.add(v if v.startswith('*') else bytes.fromhex(v))    # '*OP': too many, the opcode OP
+
+    def ram_image(self):
+        """The code in RAM where compiled code may be (WRAM, HRAM), as ({address: byte}, {address}): the
+        bytes of the instructions that ran with one version of them, the opcodes of those whose versions
+        differ in the operands only -- and those operand bytes, which change.  A byte two instructions
+        disagree on is left out with both."""
+        claims = {}                                   # address -> {byte, or None: an operand that changes}
+        insns = []
+        for a, vs in self.ramcode.items():
+            ops = set()
+            for v in vs:
+                if isinstance(v, str):
+                    ops.add(bytes.fromhex(v[1:]) if len(v) > 1 else None)
+                else:
+                    ops.add(v[:2] if v[0] == 0xCB else v[:1])
+            if len(ops) != 1 or None in ops:
+                continue                              # the opcode changes: left to the interpreter
+            (opc,) = ops
+            n = sm83.LENGTH[opc[0]]
+            if len(vs) == 1 and not isinstance(next(iter(vs)), str):
+                cl = list(next(iter(vs)))             # one version: every byte
+            else:
+                cl = list(opc) + [None] * (n - len(opc))
+            if a + n > 0xFFFF or not all(ram_ok(a + k) for k in range(n)):
+                continue
+            insns.append((a, cl))
+            for k, x in enumerate(cl):
+                claims.setdefault(a + k, set()).add(x)
+        img, var = {}, set()
+        for a, cl in insns:
+            if any(len(claims[a + k]) != 1 for k in range(len(cl))):
+                continue
+            for k, x in enumerate(cl):
+                if x is None:
+                    var.add(a + k)
+                else:
+                    img[a + k] = x
+        return img, var
 
     def flag(self, off):
         return self.cov[off] if off < len(self.cov) else 0
 
 
 class Program:
-    def __init__(self, cart, trace=None, far=True, tables=True):
+    def __init__(self, cart, trace=None, far=True, tables=True, ram=True):
         self.cart, self.trace, self.far, self.tables = cart, trace, far, tables
+        self.ram = ram and trace is not None          # the RAM region: from the bytes a trace saw run
+        self.origin = {}          # (win, bank, addr) of an entry -> how it was found (reset trace walk table far)
+        self.phase = 'reset'
+        self.table_spans = []     # the pointer tables completed: (kind, ROM offset, entries, stride)
         self.far_found = self.table_found = 0
         self.regions = {}
         self.data = cart.data
@@ -159,6 +301,14 @@ class Program:
 
     def reader(self, r):
         d = self.data
+        if r.win == RAM:
+            def read_ram(a):
+                if a in r.image:
+                    return r.image[a]
+                if a in r.var:
+                    return 0                          # an operand that changes: read at run time
+                raise IndexError(a)
+            return read_ram
 
         def read(a):
             if (a >> 14) != r.win:
@@ -168,22 +318,26 @@ class Program:
         return read
 
     def region(self, win, bank):
-        k = (win, bank % self.banks)
+        k = (win, bank % self.banks if win != RAM else 0)
         if k not in self.regions:
-            self.regions[k] = Region(*k)
+            self.regions[k] = Region(*k) if win != RAM else RamRegion(*self.trace.ram_image())
         return self.regions[k]
 
     def entry(self, win, bank, a):
-        if win is None or a >= 0x8000:
+        if win is None or (win != RAM and a >= 0x8000) or (win == RAM and not self.ram):
             return
         r = self.region(win, bank)
         if a not in r.entries:
             r.entries.add(a)
             r.work.append(a)
+            self.origin.setdefault((r.win, r.bank, a), self.phase)
 
     def _everywhere(self, a):
-        """Entries at a for every bank the tracer ran its window with and ran an instruction at a."""
+        """Entries at a for every bank the tracer ran its window with and ran an instruction at a
+        (in RAM: the RAM region's, if it ran there)."""
         if a >= 0x8000:
+            if self.trace and a in self.trace.ram_targets:
+                self.entry(RAM, 0, a)
             return
         w = a >> 14
         if not self.trace:
@@ -223,11 +377,37 @@ class Program:
         if i.kind == 'bad':
             r.problems.append(a)
             return
-        if (a + i.length - 1) >> 14 != r.win:         # runs over the end of the window
+        if not r.holds(a, i.length):                 # runs over the end of the window (or of the RAM code)
             r.problems.append(a)
             return
         r.code[a] = i
         nxt, t, k, tr = i.next, i.target, i.kind, self.trace
+        var = [n for n in range(1, i.length) if (a + n) in getattr(r, 'var', ())]
+        if var:
+            r.varops[a] = var
+        if var and k in ('jump', 'branch', 'call', 'ccall'):
+            # the target is an operand that changes: the targets the trace saw, a switch at run time
+            seen = tr.ram_edges.get(a, set()) if tr else set()
+            r.indirect[a] = sorted(x for w, b, x in seen if w == RAM and r.contains(x))
+            for w, b, x in seen:
+                if w == RAM and k in ('jump', 'branch'):
+                    self._goto(r, x)
+                elif w == RAM:
+                    r.calls.add(x)
+                    self.entry(RAM, 0, x)
+                else:
+                    self.entry(w, b, x)
+            if k == 'branch':
+                self._on(r, nxt)
+            elif k in ('call', 'ccall'):
+                self._goto(r, nxt)
+                for w, b, x in (tr.alt.get(self._site(r, nxt), ()) if tr else ()):
+                    if (w, b) == r.key:
+                        r.alt_ret.setdefault(nxt, set()).add(x)
+                        self._goto(r, x)
+                    else:
+                        self.entry(w, b, x)
+            return
         if k in ('jump', 'branch'):
             self._goto(r, t)
             if k == 'branch':
@@ -262,9 +442,12 @@ class Program:
 
     def discover(self):
         self.entry(0, 0, 0x0100)
+        self.phase = 'trace'
         if self.trace:
             for w, b, a in self.trace.targets:
                 self.entry(w, b, a)
+            for a in self.trace.ram_targets:
+                self.entry(RAM, 0, a)
             # every traced jump target and return address, in each bank its window ran with
             for o, fl in enumerate(self.trace.cov):
                 if fl & (R_JTGT | R_RET) and fl & R_OP:
@@ -272,17 +455,20 @@ class Program:
                     for w in (0, 1):
                         if b in self.trace.where.get(w, ()):
                             self.entry(w, b, (w << 14) | lo)
+        self.phase = 'walk'
         self._walk()
         if self.tables and self.trace:                # the rest of the pointer tables the trace saw entries of
             from . import tables
-            sites = dict(self.trace.ind)
+            sites = {k: {t for t in v if t[0] != RAM} for k, v in self.trace.ind.items() if k[0] != RAM}
             for k, v in self.trace.pushret.items():
                 sites.setdefault(k, set()).update(v)
             new = tables.word_tables(self, sites) | tables.bank_tables(self, self.trace.targets)
+            self.phase = 'table'
             for w, b, a in new:
                 before = len(self.region(w, b).entries)
                 self.entry(w, b, a)
                 self.table_found += len(self.region(w, b).entries) - before
+            self.phase = 'walk'
             self._walk()
         if self.far:                                  # calls into a bank, by the constants at the call
             from .farcalls import Resolver
@@ -290,17 +476,21 @@ class Program:
             while True:
                 new = []
                 for r in list(self.regions.values()):
+                    if r.win == RAM:
+                        continue                      # its constants may be rewritten as it runs
                     for e in res.resolve(r):
                         if e not in done:
                             done.add(e)
                             new.append(e)
                 if not new:
                     break
+                self.phase = 'far'
                 for w, b, a in new:
-                    if b % self.banks or w == 0:
+                    if w != RAM and (b % self.banks or w == 0):
                         before = len(self.region(w, b).entries)
                         self.entry(w, b, a)
                         self.far_found += len(self.region(w, b).entries) - before
+                self.phase = 'walk'
                 self._walk()
         for r in self.regions.values():               # entries on data: left to the interpreter
             r.entries = {a for a in r.entries if a in r.code}
@@ -323,6 +513,8 @@ class Program:
             return None
         held = set()
         for r in self.regions.values():
+            if r.win == RAM:
+                continue
             for a in r.code:
                 held.add(self.off(r.bank, a))
         ran = [o for o, x in enumerate(self.trace.cov) if x & R_OP]
@@ -356,6 +548,8 @@ class Program:
                             where.setdefault(m.group(1), rel)
         held = {}
         for r in self.regions.values():
+            if r.win == RAM:
+                continue
             for a, i in r.code.items():
                 held[self.off(r.bank, a)] = i
         bad, code = [], []

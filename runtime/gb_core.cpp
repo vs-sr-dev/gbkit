@@ -486,8 +486,29 @@ void gb_register(int w, uint32_t bank, uint16_t pc, GBFn fn) {
     t[pc & 0x3FFF] = fn;
 }
 
+// code in RAM: $C000-$DFFF and $FF80-$FFFE, each with the guard of the bytes it was compiled from
+static GBFn g_ramfn[0x4000];
+static GBGuard g_ramok[0x4000];
+static bool g_ram_any = false;
+
+void gb_register_ram(uint16_t pc, GBFn fn, GBGuard ok) {
+    if (pc < 0xC000 || (pc >= 0xE000 && pc < 0xFF80) || pc == 0xFFFF) return;
+    g_ramfn[pc - 0xC000] = fn; g_ramok[pc - 0xC000] = ok; g_ram_any = true;
+}
+
+bool gb_poll_ram(GB& c, uint16_t at, GBGuard ok) {
+    if (!gb_poll(c, at)) return false;
+    if (!ok(c)) { gb_call(c, at); return false; }              // rewritten (or another WRAM bank) under the code
+    return true;
+}
+
 GBFn gb_lookup(GB& c, uint16_t pc) {
-    if (!c.natives || pc >= 0x8000 || g_nat.empty()) return nullptr;
+    if (pc >= 0x8000) {
+        if (!c.natives || pc < 0xC000 || !g_ram_any) return nullptr;
+        GBFn fn = g_ramfn[pc - 0xC000];
+        return fn && g_ramok[pc - 0xC000](c) ? fn : nullptr;
+    }
+    if (!c.natives || g_nat.empty()) return nullptr;
     int w = pc >> 14;
     auto it = g_nat.find(nkey(w, w ? c.bankx : c.bank0));
     return it == g_nat.end() ? nullptr : it->second[pc & 0x3FFF];
@@ -735,7 +756,9 @@ void gb_reset(GB& c) {
     // the timer and the ports (MAME's machine_reset, and DIV as the boot ROM leaves it)
     c.divcount = c.cgb ? 0x1EA0 : 0xABCC;
     c.tima = 0; c.tma = 0; c.tac = 0xF8; c.shift = 10; c.shift_cycles = 1024; c.triggering = 0; c.reloading = 0;
-    c.sb = 0; c.sc = 0x7E; c.sio_count = 0; c.sio_clock = 0; c.sio_freq = 256; c.sio_n = 0;
+    // the serial clock is a bit of the divider DIV shows: in phase with it as the boot ROM leaves them (mooneye's
+    // boot_sclk_align; MAME keeps a counter of its own, started 8 cycles behind)
+    c.sb = 0; c.sc = 0x7E; c.sio_count = 0; c.sio_clock = (uint16_t)(c.divcount); c.sio_freq = 256; c.sio_n = 0;
     c.IE = 0; c.IF = 0x01;
     c.keys = 0; c.joyp = 0xCF;
     gb_map(c);

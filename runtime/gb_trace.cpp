@@ -45,6 +45,11 @@ static uint8_t raw(const GB& c, uint16_t a) {
     return 0;
 }
 
+// a RAM instruction's version (len << 24 | its bytes) -> its opcode alone (the CB's second byte with it)
+static inline uint32_t ramop(uint32_t k) {
+    return (k & 0xFF000000u) | ((k & 0xFF) == 0xCB ? (k & 0xFFFF) : (k & 0xFF));
+}
+
 void gb_trace_insn(GB& c, uint16_t at) {
     GBTrace* t = c.tr;
     uint8_t op = raw(c, at);
@@ -61,6 +66,20 @@ void gb_trace_insn(GB& c, uint16_t at) {
         t->ramexec_n++;
         if (at >= 0xFF80) t->ramexec_hram++; else if (at >= 0xC000) t->ramexec_wram++; else t->ramexec_other++;
         for (int i = 0; i < len; i++) if ((uint16_t)(at + i) >= 0x8000) t->ramexec[(uint16_t)(at + i) - 0x8000] = 1;
+        uint32_t k = (uint32_t)len << 24;
+        for (int i = 0; i < len; i++) k |= (uint32_t)raw(c, (uint16_t)(at + i)) << (8 * i);
+        const uint32_t MANY = GBTrace::RAMVER_MANY, ok = ramop(k);
+        std::vector<uint32_t>& vs = t->ramver[at];
+        if (!vs.empty() && vs[0] == MANY) { if (vs[1] != ok) vs[1] = MANY; return; }
+        if (std::find(vs.begin(), vs.end(), k) == vs.end()) {
+            if (vs.size() >= GBTrace::RAMVER_MAX) {       // too many: whether the opcode stays the same
+                uint32_t o = ok;
+                for (uint32_t x : vs) if (ramop(x) != ok) o = MANY;
+                vs.assign({ MANY, o });
+                return;
+            }
+            vs.push_back(k);
+        }
     }
 }
 
@@ -132,9 +151,35 @@ void gb_trace_bank(GB& c, uint32_t old0, uint32_t oldx) {
 
 static inline bool fixed_addr(uint8_t op) { return op == 0xE0 || op == 0xEA || op == 0xF0 || op == 0xFA || op == 0x08; }
 
+// the class of an address, for the sites (0: plain RAM, not recorded)
+static inline uint8_t aclass(uint16_t a) {
+    if (a < 0x8000) return A_MBC;
+    if (a < 0xA000) return A_VRAM;
+    if (a < 0xC000) return A_SRAM;
+    if (a < 0xE000) return 0;
+    if (a < 0xFE00) return A_ECHO;
+    if (a < 0xFEA0) return A_OAM;
+    if (a < 0xFF00) return 0;
+    if (a < 0xFF80) return A_IO;
+    return a == 0xFFFF ? A_IE : 0;
+}
+
+static void site(GB& c, uint16_t a, bool w) {
+    uint8_t k = aclass(a);
+    if (!k) return;
+    GBTrace* t = c.tr;
+    uint16_t at = t->cur_at;
+    uint32_t b = at < 0x4000 ? c.bank0 : at < 0x8000 ? c.bankx : 0xFFF;
+    GBSite& s = t->sites[b << 16 | at];
+    s.n++;
+    if (w) { s.w |= k; if (k == A_IO) s.io_w[(a >> 6) & 1] |= 1ull << (a & 63); }
+    else { s.r |= k; if (k == A_IO) s.io_r[(a >> 6) & 1] |= 1ull << (a & 63); }
+}
+
 void gb_trace_read(GB& c, uint16_t a) {
     GBTrace* t = c.tr;
     if ((uint16_t)(a - t->cur_at) < t->cur_len) return;      // the instruction's own bytes
+    if (a >= 0x8000) site(c, a, false);
     if (a < 0x8000) { mark(c, a, R_READ); return; }
     if (a >= 0xE000 && a < 0xFE00) { t->echo_n++; return; }
     if (a >= 0xFF00) { t->rd_n[a & 0xFF]++; if (!fixed_addr(t->cur_op)) t->io_r_ptr++; }
@@ -143,6 +188,7 @@ void gb_trace_read(GB& c, uint16_t a) {
 void gb_trace_write(GB& c, uint16_t a, uint8_t v) {
     GBTrace* t = c.tr;
     (void)v;
+    site(c, a, true);
     if (a < 0x8000) { if (a < 0x2000) t->ram_enable++; return; }
     if (a >= 0x8000 && t->ramexec[a - 0x8000]) t->smc_n++;
     if (a < 0xA000) {
@@ -222,7 +268,48 @@ void gb_trace_report(GB& c, const char* dir, const char* rom_path) {
             int j = i; while (j < 0x8000 && t->ramexec[j]) j++;
             std::fprintf(f, " %04X-%04X", 0x8000 + i, 0x8000 + j - 1);
         }
-    std::fprintf(f, "\ncomputed_ret %llu dropped_returns %llu\n", U(t->comp_ret), U(t->dropped));
+    std::fprintf(f, "\n");
+    // the bytes of each instruction run from RAM, every version seen ('*': too many; '*OP': too many, all with
+    // that opcode -- only the operands rewritten)
+    std::vector<uint16_t> ras;
+    for (auto& kv : t->ramver) ras.push_back(kv.first);
+    std::sort(ras.begin(), ras.end());
+    for (uint16_t a : ras) {
+        std::fprintf(f, "ramcode %04X", a);
+        const std::vector<uint32_t>& vs = t->ramver[a];
+        if (vs[0] == GBTrace::RAMVER_MANY) {
+            std::fprintf(f, " *");
+            if (vs[1] != GBTrace::RAMVER_MANY)
+                for (int i = 0; i < ((vs[1] & 0xFF) == 0xCB ? 2 : 1); i++) std::fprintf(f, "%02X", (vs[1] >> (8 * i)) & 0xFF);
+        } else
+            for (uint32_t k : vs) {
+                std::fprintf(f, " ");
+                for (uint32_t i = 0; i < (k >> 24); i++) std::fprintf(f, "%02X", (k >> (8 * i)) & 0xFF);
+            }
+        std::fprintf(f, "\n");
+    }
+    // the sites: each instruction that read or wrote VRAM, OAM, I/O, the mapper, the cartridge's RAM, the echo
+    // RAM or IE -- the classes (A_*) and the I/O registers ($FF00 + n) it reached
+    std::vector<uint32_t> sk;
+    for (auto& kv : t->sites) sk.push_back(kv.first);
+    std::sort(sk.begin(), sk.end());
+    auto ios = [&](const uint64_t* m) {
+        bool any = false;
+        for (int i = 0; i < 128; i++)
+            if (m[i >> 6] >> (i & 63) & 1) { std::fprintf(f, "%s%02X", any ? "," : "", i); any = true; }
+        if (!any) std::fprintf(f, "-");
+    };
+    for (uint32_t k : sk) {
+        const GBSite& s = t->sites[k];
+        if ((k >> 16) == 0xFFF) std::fprintf(f, "site RAM:%04X", k & 0xFFFF);
+        else std::fprintf(f, "site %03X:%04X", k >> 16, k & 0xFFFF);
+        std::fprintf(f, " w %02X r %02X io_w ", s.w, s.r);
+        ios(s.io_w);
+        std::fprintf(f, " io_r ");
+        ios(s.io_r);
+        std::fprintf(f, " n %llu\n", U(s.n));
+    }
+    std::fprintf(f, "computed_ret %llu dropped_returns %llu\n", U(t->comp_ret), U(t->dropped));
     std::fprintf(f, "rd");
     for (int i = 0; i < 256; i++) if (t->rd_n[i]) std::fprintf(f, " %02X:%llu", i, U(t->rd_n[i]));
     std::fprintf(f, "\nwr");

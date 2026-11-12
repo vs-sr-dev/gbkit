@@ -25,13 +25,17 @@ Boy Color; in `Game Boy/`, not distributed) are recompiled to C++, built,
 and run 6000 frames identical to the interpreter (lockstep: the whole
 machine -- CPU, RAM, VRAM, OAM, I/O, the LCD's state and picture, save
 memory, the clock, the sound registers -- compared at every frame). The
-interpreter still runs a few instructions a frame in nearly every game:
-the OAM DMA routine each copies to HRAM (median 0.5 million instructions
-in 6000 frames, against tens of millions native); the four games that
-copy none -- Wild Snake, Lufia - The Legend Returns, Razor Freestyle
-Scooter, Tomb Raider - Curse of the Sword -- never touch it. Two
-cartridges run without what they need from their mapper (Kirby Tilt 'n'
-Tumble's MBC7, Robopon's HuC3 clock): identical, but not playable yet.
+code games copy to RAM is compiled too -- the OAM DMA routine in HRAM,
+the routines in WRAM, those that patch their own operands -- under a
+guard on its bytes: 551 of the 663 never touch the interpreter in 6000
+frames, and the whole library runs 90 million instructions interpreted
+where it ran 609 million. What is left is code games generate as they
+run (the opcodes change: Mat Hoffman's Pro BMX, Alone in the Dark - The
+New Nightmare, Earthworm Jim, Test Drive Le Mans, the Gex games, at 2-19
+million each) and a few routines the monkey's runs never reached
+natively. Two cartridges run without what they need from their mapper
+(Kirby Tilt 'n' Tumble's MBC7, Robopon's HuC3 clock): identical, but not
+playable yet.
 
 ## Tools
 
@@ -50,6 +54,8 @@ python -m gbkit.tracer.survey "gbkit/Game Boy" --jobs 14      # every cart, one 
 python tools/mosaic.py build/trace f03000.ppm build/mosaic    # one frame of every game
 python tools/strings.py build/trace "Game Boy"                # text in the bytes no game reads
 python tools/testroms.py testroms                             # the interpreter against the test ROMs
+python -m gbkit.recomp.export ROM.gb                          # discovery as JSON (Pocketshift's input)
+python -m gbkit.recomp.export --all "gbkit/Game Boy"          # ... every cart, to build/export/KEY.json
 ```
 
 The set (from the Internet Archive, not distributed) is 1033 files: 545
@@ -103,7 +109,8 @@ build/recomp/GAME/gb.exe ROM.gb --frames 1800 --wav out.wav
 build/recomp/GAME/gb.exe ROM.gb --window --record pad.bin  # F12: a screenshot named by its frame
 build/recomp/GAME/gb.exe ROM.gb --replay pad.bin --snap N  # the same game again, headless, bit for bit
 build/recomp/GAME/gb.exe ROM.gb --state --profile          # the LCD's registers; where the interpreter ran
-python -m gbkit.recomp.all "gbkit/Game Boy" --jobs 5       # every cart: trace, recompile, build, lockstep
+python -m gbkit.recomp.all "gbkit/Game Boy" --jobs 8       # every cart: trace, recompile, build, lockstep
+python -m gbkit.recomp.all "gbkit/Game Boy" --native       # ... again, those not yet free of the interpreter
 ```
 
 - `recomp/discover.py` -- code by *region*: one of the two ROM windows
@@ -115,9 +122,20 @@ python -m gbkit.recomp.all "gbkit/Game Boy" --jobs 5       # every cart: trace, 
   with. A region is also registered at every jump target inside it and
   every address a call returns to, so that the interpreter, carrying on
   after native code has unwound, hands back at once. A walk stops at RET,
-  at an undefined opcode, at the end of the window; code in RAM (the OAM
-  DMA routine every game copies to HRAM, the odd routine in WRAM) stays
-  interpreted.
+  at an undefined opcode, at the end of the window.
+- Code in RAM -- the OAM DMA routine nearly every game copies to HRAM, the
+  routines some copy to WRAM -- is one more region, made of the bytes the
+  trace saw each instruction there run with (the tracer keeps up to four
+  versions of each). The instructions that always ran with the same bytes
+  are compiled as they are; those whose versions differ only in their
+  operands (code that patches its own constants and jump targets) read
+  their operands from RAM as they run, and a patched jump or call goes to
+  the targets the trace saw, through a switch. Each routine (the
+  instructions joined by control flow) is valid while RAM holds the bytes
+  it was compiled from: a guard compares them before the runtime enters
+  it, at the slow polls, after a call and after a write that may reach
+  them or SVBK -- and the interpreter runs it otherwise. Code whose
+  opcodes change as it runs (generated code) stays interpreted.
 - Beyond the trace, two ways to more code (`recomp/farcalls.py`,
   `recomp/tables.py`). Calls into a bank resolved without running the
   game: the routines of bank 0 are run symbolically for what they leave
@@ -134,9 +152,10 @@ python -m gbkit.recomp.all "gbkit/Game Boy" --jobs 5       # every cart: trace, 
 - Discovery checked against a disassembly: with pret's pokered built
   locally (`make compare`: identical to the set's Pokémon Red) and
   `discover --sym pokered.sym --src DIR`, each label is code or data by the
-  file that defines it. Of the 27,003 instructions discovered, none starts
-  inside data; they reach 916 of the 2,549 code labels -- 641 from the
-  monkey's trace alone. Static discovery from the reset without a trace
+  file that defines it. Of the 28,789 instructions discovered, none starts
+  inside data; they reach 982 of the 2,549 code labels -- 641 from the
+  monkey's trace alone, 777 with the calls into a bank resolved, the rest
+  from the pointer tables. Static discovery from the reset without a trace
   stays at 15: the game reaches nearly everything through tables indexed
   at run time.
 - `recomp/emit.py` -- SM83 to C++ through the interpreter's own helpers
@@ -173,6 +192,35 @@ python -m gbkit.recomp.all "gbkit/Game Boy" --jobs 5       # every cart: trace, 
   register of theirs is touched, and at the first instruction boundary
   past their next event, by the interpreter and the native code alike.
 
+## Discovery as JSON (for Pocketshift)
+
+`recomp/export.py` writes what discovery and the traces know of a
+cartridge to one JSON file (`build/export/KEY.json`; the format's details
+in the module's docstring) -- the same discovery the recompiler emits C++
+from, so what it calls code is what the lockstep holds identical:
+
+- the regions (a window and a ROM bank, or RAM), their entries and how
+  each was found -- `reset`, `trace`, `walk` (a call or jump of code
+  already found), `table`, `far` (a call into a bank resolved by its
+  constants) -- their other ways in, their code as runs of instructions,
+  the JP HL sites with the targets the trace saw, the calls whose caller
+  goes on past inline arguments, where a walk stopped;
+- the pointer tables completed, by bank, address and entries;
+- the code in RAM: the routines compiled (the OAM DMA routine marked), the
+  bytes they hold, and the addresses whose bytes changed between runs;
+- the *sites*: every instruction that reads or writes VRAM, OAM, the I/O
+  registers, the mapper, the cartridge's RAM, the echo RAM or IE, or
+  memory through a computed address -- its mode (a fixed address, HL, BC,
+  DE, `$FF00+C`, or SP), and what the trace saw it reach, I/O register by
+  register. A computed access never traced says so.
+
+Over the library (112 MB for the 663): code in RAM in 658 games, the OAM
+DMA routine recognised in 644; 3,888 pointer tables completed in 574; a
+median of 795 sites a game, 59 of them reaching VRAM, OAM or I/O through
+a computed address (Tecmo Bowl the most: 6,046); 22 games point the stack
+at the hardware or the cartridge's RAM (Pokémon Red pops its data from
+there).
+
 ## The machine, as MAME has it (and so as gbkit does)
 
 | | Game Boy (DMG) | Game Boy Color (CGB) |
@@ -201,16 +249,20 @@ HDMA5 after a general DMA) is listed in `THIRD_PARTY.md`.
 ## The test ROMs
 
 `tools/testroms.py` runs the public test ROMs (not distributed) against the
-interpreter, each read the way it reports: blargg's (the serial port, or
-`$A000`), Gekkio's mooneye suite (the registers' Fibonacci signature),
-Matt Currie's dmg-acid2 and cgb-acid2 (the picture against the reference).
-Now: both acid2 pictures exact; mooneye 84 of the 98 tests for a DMG or a
-CGB (all the CPU timing, timer, OAM DMA, MBC1, MBC2 and MBC5 ones; not yet
-the boot registers, `ei_sequence`, `ie_push`, the LCD-on and STAT-LYC
-edge timings, the MBC1 multicart); blargg 36 of 58 -- `cpu_instrs`,
-`instr_timing`, `mem_timing` (both), `halt_bug` and `interrupt_time` pass,
-the sound tests half (the APU is for the output only) and the DMG's OAM
-corruption tests not.
+interpreter, each read the way it reports: blargg's (the serial port,
+`$A000`, or the text on the screen -- the BG map holds a tile per ASCII
+code), Gekkio's mooneye suite (the registers' Fibonacci signature), Matt
+Currie's dmg-acid2 and cgb-acid2 (the picture against the reference).
+Now: both acid2 pictures exact; mooneye 85 of the 94 tests for a DMG or a
+CGB -- all the CPU timing, timer, OAM DMA, MBC1, MBC2 and MBC5 ones, the
+registers and the serial clock as the boot ROM leaves them; not yet
+`ei_sequence`, `ie_push`, `halt_ime0_nointr_timing`, the LCD-on, HBlank and
+STAT-LYC edge timings (gbkit follows MAME's there), the MBC1 multicart.
+Four more are for a CGB running a DMG cartridge in its compatibility mode,
+which gbkit does not do (a DMG game runs as a DMG): skipped. blargg 39 of
+58 -- `cpu_instrs`, `instr_timing`, `mem_timing` (both), `halt_bug` and
+`interrupt_time` pass, the sound tests half (the APU is for the output
+only) and the DMG's OAM corruption tests not.
 
 ## Survey of the library (6000 frames each, monkey pad)
 
@@ -293,7 +345,9 @@ What the runs showed:
   are made anew each visit, so the monkey reaches little of it: 12.5 KB of
   code from 15 banks, 170 calls whose caller goes on past inline
   arguments, 62 returns used as jumps, 263 bytes run from RAM beyond the
-  DMA routine, double speed; identical in lockstep all the same. A recorded
+  DMA routine (6.7 million instructions in 6000 frames, all compiled now:
+  it runs without the interpreter), double speed; identical in lockstep
+  all the same. A recorded
   session (`--record`, then `--trace` with `--replay`) gives discovery the
   floors the monkey does not reach.
 - **The clock.** Pokémon Gold, Silver and Crystal ask the time of day at

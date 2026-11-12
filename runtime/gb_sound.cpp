@@ -233,6 +233,8 @@ void snd_reset(GB& c) {
     snd_write(c, 0xFF25, 0xF3);
     snd_write(c, 0xFF11, 0x80);
     snd_write(c, 0xFF12, 0xF3);
+    // the boot ROM's chime leaves channel 1 on (NR52 reads $F1), its envelope run down to silence
+    s.ch[0].on = 1; s.ch[0].vol = 0;
 }
 
 void gb_write_wav(const char* path, const int16_t* smp, size_t n, int rate) {

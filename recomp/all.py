@@ -1,6 +1,6 @@
 """Every cartridge through the whole route: trace, recompile, build, lockstep.
 
-    python -m gbkit.recomp.all ROMDIR [--frames 6000] [--only NAME] [--jobs N] [--resume]
+    python -m gbkit.recomp.all ROMDIR [--frames 6000] [--only NAME] [--jobs N] [--resume | --native]
 
 For each ROM: tracer/gbtrace (6000 frames of the monkey pad) unless its
 trace is there (recorded sessions traced to build/trace/KEY.* are merged
@@ -24,14 +24,14 @@ from . import discover
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def one(rom, frames, build_dir, resume=False):
+def one(rom, frames, build_dir, resume=False, native=False):
     c = cartmod.Cart.load(rom)
     k = c.key
     out = os.path.join(build_dir, 'recomp', k)
     done = os.path.join(out, 'result.txt')
     if resume and os.path.exists(done):
         res = open(done, encoding='utf8', errors='replace').read()
-        if f'lockstep: identical for {frames} frames' in res:
+        if f'lockstep: identical for {frames} frames' in res and (not native or 'interpreted insns 0 ' in res):
             return k, c, res, []
     tdir = os.path.join(build_dir, 'trace', k)
     if not os.path.exists(os.path.join(tdir, 'report.txt')):
@@ -59,13 +59,14 @@ def main(argv=None):
     ap.add_argument('--jobs', type=int, default=4)
     ap.add_argument('--build-dir', default=os.path.join(ROOT, 'build'))
     ap.add_argument('--resume', action='store_true', help='skip the games already identical')
+    ap.add_argument('--native', action='store_true', help='skip the games already identical without the interpreter')
     a = ap.parse_args(argv)
     roms = roms_in(a.romdir)
     if a.only:
         roms = [r for r in roms if a.only.lower() in r.lower()]
     ok = native = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as ex:
-        for k, c, res, logs in ex.map(lambda r: one(r, a.frames, a.build_dir, a.resume), roms):
+        for k, c, res, logs in ex.map(lambda r: one(r, a.frames, a.build_dir, a.resume or a.native, a.native), roms):
             same = f'lockstep: identical for {a.frames} frames' in res
             ok += same
             m = re.search(r'interpreted insns (\d+)\s+native calls (\d+)\s+fallbacks (\d+)\s+unwinds (\d+)\s+max depth (\d+)', res)

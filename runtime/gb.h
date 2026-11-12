@@ -314,12 +314,23 @@ void gb_di(GB& c);                         // DI
 bool gb_poll_at(GB& c, uint16_t at, int w, uint32_t bank);    // false: the caller returns
 #define GB_POLL(c, at, w, bank) do { if ((c).t >= (c).next && !gb_poll_at((c), (at), (w), (bank))) return; \
     GB_HIST(c, at); } while (0)
+// code compiled from RAM (WRAM, HRAM: the OAM DMA routine) holds only while RAM holds the bytes it was
+// compiled from: `ok` says so.  The poll leaves to the interpreter when they changed under it.
+typedef bool (*GBGuard)(const GB&);
+bool gb_poll_ram(GB& c, uint16_t at, GBGuard ok);             // false: the caller returns
+#define GB_POLLR(c, at, ok) do { if ((c).t >= (c).next && !gb_poll_ram((c), (at), (ok))) return; \
+    GB_HIST(c, at); } while (0)
+// the byte at a in WRAM ($C000-$DFFF, the CGB's bank as mapped) or HRAM, without side effects
+static inline uint8_t gb_ram_byte(const GB& c, uint16_t a) {
+    return a >= 0xFF80 ? c.hram[a - 0xFF80] : c.rd_pg[a >> 12][a & 0xFFF];
+}
 
 // ---- calls between native and interpreted code ----
 void gb_call(GB& c, uint16_t pc);          // run code at pc as a called routine
 GBFn gb_lookup(GB& c, uint16_t pc);        // the native function there (banks as now), or null
 void gb_exec(GB& c, int base);             // interpret from PC until a return lifts SP above base
 void gb_register(int w, uint32_t bank, uint16_t pc, GBFn fn);   // fn(c, pc) runs from pc
+void gb_register_ram(uint16_t pc, GBFn fn, GBGuard ok);          // ... in RAM, while ok(c)
 void gb_register_all();                    // generated: every native function
 [[noreturn]] void gb_jam(GB& c, const char* why);
 
