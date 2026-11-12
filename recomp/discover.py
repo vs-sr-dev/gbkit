@@ -96,20 +96,39 @@ def _parse_loc(s):
     return a >> 14, int(m.group(1), 16), a
 
 
+def traces_for(build_dir, key):
+    """The trace directories of a game: build/trace/KEY (the monkey's) and build/trace/KEY.* (recorded
+    sessions, traced with --replay), those that hold a report."""
+    import glob
+    base = os.path.join(build_dir, 'trace', key)
+    out = [d for d in [base] + sorted(glob.glob(base + '.*')) if os.path.exists(os.path.join(d, 'report.txt'))]
+    return out
+
+
 class Trace:
     """What gbtrace saw: per ROM byte flags, the banks each window ran code with, the indirect
     jumps, the computed returns, the transfers between the windows."""
 
-    def __init__(self, path, cart):
+    def __init__(self, paths, cart):
+        """paths: one trace directory or several (the monkey's and recorded sessions'), merged."""
         self.cart = cart
-        self.cov = open(os.path.join(path, 'cov.bin'), 'rb').read()
-        rep = open(os.path.join(path, 'report.txt'), encoding='utf8', errors='replace').read()
+        if isinstance(paths, str):
+            paths = [paths]
         self.where = {}           # window -> {banks}
-        for w, b in re.findall(r'^where win (\d) bank ([0-9A-F]+)', rep, re.M):
-            self.where.setdefault(int(w), set()).add(int(b, 16))
         self.ind = {}             # (win, bank, addr) of a JP HL -> {(win, bank, addr)}
+        self.pushret = {}         # (win, bank, addr) of a RET no call pushed for -> {(win, bank, addr)}
         self.alt = {}             # (win, bank, addr) a call pushed -> {(win, bank, addr) its caller went on at}
         self.targets = set()      # every traced target in ROM
+        cov = None
+        for path in paths:
+            c = open(os.path.join(path, 'cov.bin'), 'rb').read()
+            cov = bytearray(c) if cov is None else bytearray(a | b for a, b in zip(cov, c))
+            self._read(open(os.path.join(path, 'report.txt'), encoding='utf8', errors='replace').read())
+        self.cov = bytes(cov or b'')
+
+    def _read(self, rep):
+        for w, b in re.findall(r'^where win (\d) bank ([0-9A-F]+)', rep, re.M):
+            self.where.setdefault(int(w), set()).add(int(b, 16))
         for k, s, d in re.findall(r'^edge (\w) (\S+) -> (\S+) x\d+', rep, re.M):
             to = _parse_loc(d)
             if not to or to[0] is None:
@@ -120,14 +139,17 @@ class Trace:
                 self.ind.setdefault(fr, set()).add(to)
             if k in 'ra' and fr and fr[0] is not None:
                 self.alt.setdefault(fr, set()).add(to)
+            if k == 'p' and fr and fr[0] is not None:
+                self.pushret.setdefault(fr, set()).add(to)
 
     def flag(self, off):
         return self.cov[off] if off < len(self.cov) else 0
 
 
 class Program:
-    def __init__(self, cart, trace=None):
-        self.cart, self.trace = cart, trace
+    def __init__(self, cart, trace=None, far=True, tables=True):
+        self.cart, self.trace, self.far, self.tables = cart, trace, far, tables
+        self.far_found = self.table_found = 0
         self.regions = {}
         self.data = cart.data
         self.banks = cart.banks
@@ -179,6 +201,13 @@ class Program:
         else:
             self._everywhere(t)
 
+    def _on(self, r, nxt):
+        """Control falls through to nxt: walked on, not a way in of its own."""
+        if r.contains(nxt):
+            r.work.append(nxt)
+        else:
+            self._everywhere(nxt)
+
     def _site(self, r, a):
         return (r.win, r.bank, a)
 
@@ -202,7 +231,7 @@ class Program:
         if k in ('jump', 'branch'):
             self._goto(r, t)
             if k == 'branch':
-                self._goto(r, nxt)
+                self._on(r, nxt)
         elif k in ('call', 'ccall', 'rst'):
             r.calls.add(t)
             if r.contains(t):
@@ -229,7 +258,7 @@ class Program:
         else:                                   # falls through (a conditional return too)
             if k in ('halt', 'stop'):
                 r.resumes.add(nxt)
-            self._goto(r, nxt)
+            self._on(r, nxt)
 
     def discover(self):
         self.entry(0, 0, 0x0100)
@@ -243,6 +272,43 @@ class Program:
                     for w in (0, 1):
                         if b in self.trace.where.get(w, ()):
                             self.entry(w, b, (w << 14) | lo)
+        self._walk()
+        if self.tables and self.trace:                # the rest of the pointer tables the trace saw entries of
+            from . import tables
+            sites = dict(self.trace.ind)
+            for k, v in self.trace.pushret.items():
+                sites.setdefault(k, set()).update(v)
+            new = tables.word_tables(self, sites) | tables.bank_tables(self, self.trace.targets)
+            for w, b, a in new:
+                before = len(self.region(w, b).entries)
+                self.entry(w, b, a)
+                self.table_found += len(self.region(w, b).entries) - before
+            self._walk()
+        if self.far:                                  # calls into a bank, by the constants at the call
+            from .farcalls import Resolver
+            res, done = Resolver(self), set()
+            while True:
+                new = []
+                for r in list(self.regions.values()):
+                    for e in res.resolve(r):
+                        if e not in done:
+                            done.add(e)
+                            new.append(e)
+                if not new:
+                    break
+                for w, b, a in new:
+                    if b % self.banks or w == 0:
+                        before = len(self.region(w, b).entries)
+                        self.entry(w, b, a)
+                        self.far_found += len(self.region(w, b).entries) - before
+                self._walk()
+        for r in self.regions.values():               # entries on data: left to the interpreter
+            r.entries = {a for a in r.entries if a in r.code}
+            r.resumes = {a for a in r.resumes if a in r.code}
+        self.regions = {k: r for k, r in self.regions.items() if r.entries}
+        return self
+
+    def _walk(self):
         busy = True
         while busy:
             busy = False
@@ -250,11 +316,6 @@ class Program:
                 while r.work:
                     busy = True
                     self._step(r)
-        for r in self.regions.values():               # entries on data: left to the interpreter
-            r.entries = {a for a in r.entries if a in r.code}
-            r.resumes = {a for a in r.resumes if a in r.code}
-        self.regions = {k: r for k, r in self.regions.items() if r.entries}
-        return self
 
     def coverage(self):
         """Executed instruction starts (per the trace) that some region holds."""
@@ -320,18 +381,21 @@ class Program:
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='gbkit.recomp.discover')
     ap.add_argument('rom')
-    ap.add_argument('--trace')
+    ap.add_argument('--trace', action='append', help='a trace directory (more than one: merged)')
     ap.add_argument('--report', action='store_true')
     ap.add_argument('--sym', help="an RGBDS .sym of the same ROM (a disassembly's, built locally)")
     ap.add_argument('--src', help="the disassembly's source tree: where a label is defined says code or data")
     ap.add_argument('--missed', action='store_true', help='list the code labels discovery did not reach')
+    ap.add_argument('--no-far', action='store_true', help='no static resolution of calls into a bank')
+    ap.add_argument('--no-tables', action='store_true', help='no completion of the traced pointer tables')
     a = ap.parse_args(argv)
     c = cartmod.Cart.load(a.rom)
     tr = Trace(a.trace, c) if a.trace else None
-    p = Program(c, tr).discover()
+    p = Program(c, tr, far=not a.no_far, tables=not a.no_tables).discover()
     insns = sum(len(r.code) for r in p.regions.values())
     ents = sum(len(r.entries) for r in p.regions.values())
-    print(f'{c.key}: {len(p.regions)} regions, {ents} entries, {insns} instructions')
+    print(f'{c.key}: {len(p.regions)} regions, {ents} entries, {insns} instructions'
+          + f' ({p.far_found} entries from calls into a bank, {p.table_found} from pointer tables)')
     cov = p.coverage()
     if cov:
         print(f'  traced instructions held by a region: {cov[0]}/{cov[1]}')

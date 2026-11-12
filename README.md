@@ -118,13 +118,27 @@ python -m gbkit.recomp.all "gbkit/Game Boy" --jobs 5       # every cart: trace, 
   at an undefined opcode, at the end of the window; code in RAM (the OAM
   DMA routine every game copies to HRAM, the odd routine in WRAM) stays
   interpreted.
+- Beyond the trace, two ways to more code (`recomp/farcalls.py`,
+  `recomp/tables.py`). Calls into a bank resolved without running the
+  game: the routines of bank 0 are run symbolically for what they leave
+  -- the value they wrote to the mapper and how they leave (a return, or
+  JP HL to an address made of their inputs or of the bytes after their
+  call) -- so `ld b, BANK / ld hl, Target / call Bankswitch`, `ld a, BANK /
+  ld [$2000], a / call Target`, a routine that switches and returns, and an
+  RST with its arguments inline all come out as an entry, by the constants
+  the registers hold at the call. And pointer tables completed from the
+  entries the trace saw: the table holding two or more traced targets of
+  one JP HL (2-byte addresses) or of the calls into a bank (3-byte bank
+  and address records, pret's Predef), grown both ways while each entry
+  points at code that decodes.
 - Discovery checked against a disassembly: with pret's pokered built
   locally (`make compare`: identical to the set's Pokémon Red) and
   `discover --sym pokered.sym --src DIR`, each label is code or data by the
-  file that defines it. Of the 19,096 instructions discovered from the
-  monkey's trace, none starts inside data; they reach 641 of the 2,549
-  code labels (the trace is the limit: static discovery from the reset
-  alone, through bank switches and jump tables, reaches 13).
+  file that defines it. Of the 27,003 instructions discovered, none starts
+  inside data; they reach 916 of the 2,549 code labels -- 641 from the
+  monkey's trace alone. Static discovery from the reset without a trace
+  stays at 15: the game reaches nearly everything through tables indexed
+  at run time.
 - `recomp/emit.py` -- SM83 to C++ through the interpreter's own helpers
   (`runtime/gb.h`), every access in the interpreter's order and every
   charge where it makes it: the fetches first (4 cycles each, one charge

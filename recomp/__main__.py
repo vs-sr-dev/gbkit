@@ -1,6 +1,7 @@
 """Recompile a Game Boy cartridge to C++ and build it with the runtime.
 
-    python -m gbkit.recomp ROM.gb --trace build/trace/KEY --out build/recomp/KEY [--build]
+    python -m gbkit.recomp ROM.gb --trace build/trace/KEY [--trace build/trace/KEY.session ...]
+                                  --out build/recomp/KEY [--build]
                                   [-O g|1|2] [--history] [--no-comments]
 
 The regions (recomp/discover.py) become C++ (recomp/emit.py), a few regions a
@@ -77,7 +78,7 @@ def generate(rom, trace, out, comments=True, log=print):
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='gbkit.recomp')
     ap.add_argument('rom')
-    ap.add_argument('--trace')
+    ap.add_argument('--trace', action='append', help='a trace directory (more than one: merged)')
     ap.add_argument('--out', required=True)
     ap.add_argument('--build', action='store_true')
     ap.add_argument('--no-comments', action='store_true')

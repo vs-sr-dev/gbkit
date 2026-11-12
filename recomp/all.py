@@ -3,7 +3,8 @@
     python -m gbkit.recomp.all ROMDIR [--frames 6000] [--only NAME] [--jobs N] [--resume]
 
 For each ROM: tracer/gbtrace (6000 frames of the monkey pad) unless its
-trace is there, `recomp` to build/recomp/KEY, g++, then `gb.exe --lockstep`
+trace is there (recorded sessions traced to build/trace/KEY.* are merged
+in), `recomp` to build/recomp/KEY, g++, then `gb.exe --lockstep`
 -- the interpreter and the native code side by side, the machine compared
 at every frame -- and one line of results.  A cartridge whose mapper the
 runtime does not cover is reported as such.
@@ -18,6 +19,7 @@ import sys
 from .. import cart as cartmod
 from ..tracer.survey import roms_in, trace
 from . import __main__ as recomp
+from . import discover
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -36,7 +38,7 @@ def one(rom, frames, build_dir, resume=False):
         trace(rom, tdir, frames)
     logs = []
     try:
-        files, _ = recomp.generate(rom, tdir, out, log=logs.append)
+        files, _ = recomp.generate(rom, discover.traces_for(build_dir, k), out, log=logs.append)
         recomp.build(out, files, log=logs.append)
     except Exception as e:                       # noqa: BLE001 -- reported per game
         return k, c, f'BUILD FAILED: {str(e)[:300]}', logs
