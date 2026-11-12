@@ -350,6 +350,19 @@ What the runs showed:
   all the same. A recorded
   session (`--record`, then `--trace` with `--replay`) gives discovery the
   floors the monkey does not reach.
+- **Alone in the Dark - The New Nightmare** (CGB-only, MBC5, 4 MB) shows
+  its pre-rendered rooms in more colours than the CGB's palettes hold by
+  rewriting a background palette on every line -- 6.2 million palette
+  writes in 6000 frames, about seven bytes a line -- and it does it with
+  code it writes for each room: in WRAM at `$D000`, line after line, a
+  wait for HBlank (`ldh a, [$41] / and 3 / jr nz`), `ld hl, $FF69`, then
+  the colours themselves as the operands of `ld [hl], n` (the fastest way
+  into the palette in the few cycles HBlank gives), and a `jp` back to ROM
+  where the list ends. The lists differ from room to room -- the same
+  address is an opcode in one and an operand in another -- so the code
+  stays interpreted (14.5 million instructions in 6000 frames); the copy
+  that loads the tiles, from bank to bank of VRAM, is a fixed routine in
+  WRAM and runs native.
 - **The clock.** Pokémon Gold, Silver and Crystal ask the time of day at
   a new game and keep it in the MBC3's clock; run on the machine's time,
   not the PC's, the clock is the same in both machines of the lockstep.
