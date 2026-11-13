@@ -102,6 +102,7 @@ static void draw_line(GB& c) {
         if (attr & 0x20) col = 7 - col;
         int to = (v.lcdc & 0x10) ? tile * 16 : 0x1000 + (int8_t)tile * 16;
         if (attr & 0x08) to += 0x2000;
+        if (c.tr && to < 0x1800) c.tr->shown[to >> 4] |= 1;
         uint8_t lo = vr[to + row * 2], hi = vr[to + row * 2 + 1];
         int ci = ((lo >> (7 - col)) & 1) | ((hi >> (7 - col)) & 1) << 1;
         bgc[x] = (uint8_t)ci; bgp[x] = attr & 0x80;
@@ -130,6 +131,9 @@ static void draw_line(GB& c) {
         if (attr & 0x40) row = h - 1 - row;
         uint8_t tile = h == 16 ? (sp[2] & 0xFE) : sp[2];
         int to = tile * 16 + row * 2 + ((cgb && (attr & 8)) ? 0x2000 : 0);
+        if (c.tr && to < 0x1800)
+            c.tr->shown[to >> 4] |= (uint8_t)(2 | ((attr & 0x20) ? 4 : 0) | ((attr & 0x40) ? 8 : 0) |
+                                             (!cgb && (attr & 0x10) ? 16 : 0));
         uint8_t lo = vr[to], hi = vr[to + 1];
         for (int k = 0; k < 8; k++) {
             int x = sx + k;

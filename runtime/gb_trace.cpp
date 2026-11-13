@@ -255,6 +255,8 @@ void gb_trace_report(GB& c, const char* dir, const char* rom_path) {
     if (f) { std::fwrite(t->cov.data(), 1, t->cov.size(), f); std::fclose(f); }
     f = std::fopen((d + "/ram.bin").c_str(), "wb");
     if (f) { std::fwrite(t->ramuse.data(), 1, t->ramuse.size(), f); std::fclose(f); }
+    f = std::fopen((d + "/tiles.bin").c_str(), "wb");
+    if (f) { std::fwrite(t->shown, 1, sizeof t->shown, f); std::fclose(f); }
     f = std::fopen((d + "/report.txt").c_str(), "w");
     if (!f) return;
     auto U = [](uint64_t x) { return (unsigned long long)x; };

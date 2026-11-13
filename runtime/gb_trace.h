@@ -56,6 +56,10 @@ struct GBTrace {
     uint64_t stat_irq_frame = 0, stat_irq_max = 0, lyc_hits = 0;
     uint32_t cgb_bpal_used = 0, cgb_opal_used = 0;    // bit masks of the palettes drawn with
     uint8_t tiles[2][384 / 8] = { { 0 } };     // tiles written, per VRAM bank
+    // tiles drawn (bank 0; tiles.bin): 1 background or window, 2 a sprite, 4 a sprite flipped in X,
+    // 8 in Y, 16 a sprite with the second palette (OBP1, the DMG's) -- what Pocketshift needs to
+    // know of the tiles never shown (room for flipped copies: the Game Gear cannot flip sprites)
+    uint8_t shown[384] = { 0 };
     std::map<uint32_t, uint64_t> irq_at;       // where the program was at an interrupt (bank << 16 | pc)
     int irq_depth = 0, irq_depth_max = 0;
     // the current instruction (for telling an operand fetch from a data read)
