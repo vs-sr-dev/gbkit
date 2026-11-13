@@ -89,8 +89,10 @@ caller goes on elsewhere (an RST's inline arguments skipped), returns no
 call pushed, interrupt entries, code run from RAM and self-modifying writes
 to it, bank switches (and of the bank the code runs in), HALT, the ports
 read and written, and the survey's columns -- `cov.bin` (a flag per ROM
-byte: opcode, operand, read as data, jump target, return address) and PPM
-frames.
+byte: opcode, operand, read as data, jump target, return address), `ram.bin`
+(a flag per byte of work RAM and HRAM: read, written -- what of it a game
+never reads, where Pocketshift keeps its own state; the report adds the
+lowest SP seen) and PPM frames.
 
 The boot ROM is not run (it is not distributed, nor needed): the CPU starts
 at `$0100` with the registers the Pan Docs give for each model -- A = $01
@@ -212,7 +214,11 @@ from, so what it calls code is what the lockstep holds identical:
   registers, the mapper, the cartridge's RAM, the echo RAM or IE, or
   memory through a computed address -- its mode (a fixed address, HL, BC,
   DE, `$FF00+C`, or SP), and what the trace saw it reach, I/O register by
-  register. A computed access never traced says so.
+  register, and for a computed address the 256-byte pages of RAM it
+  reached (format 2: the computed accesses that reached plain RAM only are
+  listed too, with their pages -- Pocketshift turns one that reaches work
+  RAM alone into the Z80's own instruction, one that reaches HRAM into an
+  access to where it keeps HRAM). A computed access never traced says so.
 
 Over the library (112 MB for the 663): code in RAM in 658 games, the OAM
 DMA routine recognised in 644; 3,888 pointer tables completed in 574; a

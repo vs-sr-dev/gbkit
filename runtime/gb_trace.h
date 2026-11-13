@@ -17,12 +17,17 @@ struct GBSlot { uint16_t ret; uint8_t kind; uint32_t bank; };   // a return addr
 // what one instruction (a site: its bank and address) reads and writes beyond plain RAM -- Pocketshift's
 // question: which accesses reach the hardware, and through which addresses
 enum { A_VRAM = 1, A_OAM = 2, A_IO = 4, A_MBC = 8, A_SRAM = 16, A_ECHO = 32, A_IE = 64 };
-struct GBSite { uint8_t w = 0, r = 0; uint64_t io_w[2] = { 0, 0 }, io_r[2] = { 0, 0 }; uint64_t n = 0; };
+// ram_w/ram_r: the 256-byte pages of $C000-$FFFF it reached through a computed address (bit n: $C000 + 256n)
+struct GBSite { uint8_t w = 0, r = 0; uint64_t io_w[2] = { 0, 0 }, io_r[2] = { 0, 0 }; uint64_t n = 0; uint64_t ram_w = 0, ram_r = 0; };
 
 struct GBTrace {
     std::vector<uint8_t> cov;                  // a flag set per ROM byte
     std::map<uint64_t, uint64_t> where;        // (window, bank) -> instructions run there
     std::vector<uint8_t> ramexec;              // $8000-$FFFF: run from there
+    // $C000-$FFFF (echo RAM folded onto WRAM): 1 read, 2 written -- what of the work RAM and
+    // HRAM a game never touches (Pocketshift puts its own state there); ram.bin
+    std::vector<uint8_t> ramuse;
+    uint16_t sp_min = 0xFFFF;                  // the lowest SP seen in WRAM or HRAM
     std::vector<uint8_t> ramwritten;           // ... and written after it ran (SMC)
     uint64_t ramexec_n = 0, smc_n = 0, ramexec_hram = 0, ramexec_wram = 0, ramexec_other = 0;
     // the bytes each instruction in RAM was run with (len << 24 | bytes), up to RAMVER_MAX versions

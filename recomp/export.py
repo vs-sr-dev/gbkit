@@ -30,9 +30,13 @@ from, so what the JSON says is code is what the lockstep holds identical:
   push, pop, call or return the trace saw reach the hardware -- Pokémon Red
   pops from the cartridge's RAM), the classes and I/O registers the trace
   saw it reach (`traced`: false when it never ran, so only its mode is
-  known; a computed access the trace saw reach plain RAM only is counted in
-  the summary, not listed).  Pocketshift's problem number one: a computed
-  address that reaches VRAM or I/O.
+  known), and for a computed address the 256-byte pages of RAM it reached
+  (`ram_w`, `ram_r`: "C0" .. "FF", HRAM in "FF").  Version 2 lists the
+  computed accesses that reached plain RAM only too (no class, their pages;
+  none at all: they read the ROM), and counts them in the summary's
+  `sites_ptr_ram_only`.  Pocketshift's problem number one: a computed
+  address that reaches VRAM or I/O; number two: one that reaches HRAM
+  (which it keeps elsewhere) or the RAM it takes for itself.
 
 Addresses are hex strings: "BBB:AAAA" (a ROM bank and an address), "RAM:AAAA",
 or "AAAA" inside a region (whose window and bank say the rest).
@@ -50,7 +54,7 @@ from . import discover
 from .discover import RAM
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FORMAT, VERSION = 'gbkit-discovery', 1
+FORMAT, VERSION = 'gbkit-discovery', 2
 CLASSES = [(1, 'vram'), (2, 'oam'), (4, 'io'), (8, 'mbc'), (16, 'sram'), (32, 'echo'), (64, 'ie')]
 
 
@@ -162,13 +166,14 @@ def is_oam_dma(r, entry):
 
 
 def read_sites(trace_dirs):
-    """The trace's sites: loc -> {w, r, io_w, io_r, n}, merged over the traces."""
+    """The trace's sites: loc -> {w, r, io_w, io_r, n, ram_w, ram_r}, merged over the traces."""
     out = {}
     for d in trace_dirs:
         rep = open(os.path.join(d, 'report.txt'), encoding='utf8', errors='replace').read()
-        for at, w, r, iw, ir, n in re.findall(
-                r'^site (\S+) w ([0-9A-F]{2}) r ([0-9A-F]{2}) io_w (\S+) io_r (\S+) n (\d+)', rep, re.M):
-            s = out.setdefault(at, dict(w=0, r=0, io_w=set(), io_r=set(), n=0))
+        for at, w, r, iw, ir, n, rw, rr in re.findall(
+                r'^site (\S+) w ([0-9A-F]{2}) r ([0-9A-F]{2}) io_w (\S+) io_r (\S+) n (\d+)'
+                r'(?: ram_w ([0-9A-F]{16}) ram_r ([0-9A-F]{16}))?', rep, re.M):
+            s = out.setdefault(at, dict(w=0, r=0, io_w=set(), io_r=set(), n=0, ram_w=0, ram_r=0))
             s['w'] |= int(w, 16)
             s['r'] |= int(r, 16)
             if iw != '-':
@@ -176,7 +181,15 @@ def read_sites(trace_dirs):
             if ir != '-':
                 s['io_r'].update(int(x, 16) for x in ir.split(','))
             s['n'] += int(n)
+            if rw:
+                s['ram_w'] |= int(rw, 16)
+                s['ram_r'] |= int(rr, 16)
     return out
+
+
+def pages(mask):
+    """A ram_w/ram_r mask -> the pages' high bytes, as hex strings ("C0" .. "FF")."""
+    return [f'{0xC0 + i:02X}' for i in range(64) if mask >> i & 1]
 
 
 def ran_at(p, r, a):
@@ -233,16 +246,26 @@ def export(rom, trace_dirs):
             if mode == 'fixed' and aclass(fixed) is None:
                 continue                                  # a fixed address in plain RAM: nothing to say
             ran = ran_at(p, r, a)
-            if mode == 'sp' and not t:
+            hw = bool(t and (t['w'] or t['r']))
+            if mode == 'sp' and not hw:
+                used_sites.add(at)
                 continue                                  # the stack, in RAM as far as anyone saw
-            if not t and ran and mode != 'fixed':
-                ptr_ram += 1                              # ran, through a pointer, reaching plain RAM only
-                continue
             s = {'at': at, 'insn': i.text(), 'mode': mode}
             if fixed is not None:
                 s['addr'] = x4(fixed)
             s['read'], s['write'] = rd, wr
-            if t:
+            if not hw and ran and mode != 'fixed':
+                # ran, through a pointer, reaching plain RAM only (its pages) or the ROM (none)
+                ptr_ram += 1
+                s['traced'] = True
+                s['w'], s['r'] = [], []
+                s['ram_w'], s['ram_r'] = pages(t['ram_w'] if t else 0), pages(t['ram_r'] if t else 0)
+                sites.append(s)
+                used_sites.add(at)
+                continue
+            if t and (t['ram_w'] or t['ram_r']):
+                s['ram_w'], s['ram_r'] = pages(t['ram_w']), pages(t['ram_r'])
+            if hw:
                 used_sites.add(at)
                 s['traced'] = True
                 s['w'], s['r'] = classes(t['w']), classes(t['r'])
@@ -259,9 +282,11 @@ def export(rom, trace_dirs):
             sites.append(s)
     # sites the trace saw in code discovery does not hold (RAM code left to the interpreter): as the trace has them
     for at, t in sorted(traced.items()):
-        if at in used_sites:
+        if at in used_sites or not (t['w'] or t['r'] or t['ram_w'] or t['ram_r']):
             continue
         s = {'at': at, 'insn': None, 'mode': None, 'traced': True, 'w': classes(t['w']), 'r': classes(t['r'])}
+        if t['ram_w'] or t['ram_r']:
+            s['ram_w'], s['ram_r'] = pages(t['ram_w']), pages(t['ram_r'])
         if t['io_w']:
             s['io_w'] = [x4(0xFF00 + x) for x in sorted(t['io_w'])]
         if t['io_r']:

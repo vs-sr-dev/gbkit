@@ -56,6 +56,7 @@ void gb_trace_insn(GB& c, uint16_t at) {
     int len = LEN[op];
     t->cur_at = at; t->cur_len = (uint8_t)len; t->cur_op = op;
     t->insn_n++;
+    if (c.SP >= 0xC000 && c.SP < t->sp_min) t->sp_min = c.SP;
     t->ops[op == 0xCB ? 256 + raw(c, (uint16_t)(at + 1)) : op]++;
     if (at < 0x8000) {
         int w = at >> 14;
@@ -166,19 +167,36 @@ static inline uint8_t aclass(uint16_t a) {
 
 static void site(GB& c, uint16_t a, bool w) {
     uint8_t k = aclass(a);
-    if (!k) return;
     GBTrace* t = c.tr;
     uint16_t at = t->cur_at;
     uint32_t b = at < 0x4000 ? c.bank0 : at < 0x8000 ? c.bankx : 0xFFF;
+    if (!k) {
+        // plain RAM through a computed address: its page, for Pocketshift (which RAM a pointer reaches)
+        if (a >= 0xC000 && !fixed_addr(t->cur_op)) {
+            GBSite& s = t->sites[b << 16 | at];
+            (w ? s.ram_w : s.ram_r) |= 1ull << ((a - 0xC000) >> 8);
+        }
+        return;
+    }
     GBSite& s = t->sites[b << 16 | at];
     s.n++;
     if (w) { s.w |= k; if (k == A_IO) s.io_w[(a >> 6) & 1] |= 1ull << (a & 63); }
     else { s.r |= k; if (k == A_IO) s.io_r[(a >> 6) & 1] |= 1ull << (a & 63); }
 }
 
+// a RAM address's index in ramuse ($C000-$FFFF, the echo folded onto WRAM), or -1
+static inline int ram_index(uint16_t a) {
+    if (a < 0xC000) return -1;
+    if (a < 0xFE00) return (a - 0xC000) & 0x1FFF;
+    if (a >= 0xFF80 && a < 0xFFFF) return a - 0xC000;
+    return -1;
+}
+
 void gb_trace_read(GB& c, uint16_t a) {
     GBTrace* t = c.tr;
     if ((uint16_t)(a - t->cur_at) < t->cur_len) return;      // the instruction's own bytes
+    int ri = ram_index(a);
+    if (ri >= 0) t->ramuse[ri] |= 1;
     if (a >= 0x8000) site(c, a, false);
     if (a < 0x8000) { mark(c, a, R_READ); return; }
     if (a >= 0xE000 && a < 0xFE00) { t->echo_n++; return; }
@@ -188,6 +206,8 @@ void gb_trace_read(GB& c, uint16_t a) {
 void gb_trace_write(GB& c, uint16_t a, uint8_t v) {
     GBTrace* t = c.tr;
     (void)v;
+    int ri = ram_index(a);
+    if (ri >= 0) t->ramuse[ri] |= 2;
     site(c, a, true);
     if (a < 0x8000) { if (a < 0x2000) t->ram_enable++; return; }
     if (a >= 0x8000 && t->ramexec[a - 0x8000]) t->smc_n++;
@@ -223,6 +243,7 @@ void gb_trace_frame(GB& c) {
 void gb_trace_begin(GB& c) {
     c.tr = new GBTrace();
     c.tr->cov.assign(c.romsize, 0);
+    c.tr->ramuse.assign(0x4000, 0);
     c.natives = false;
     gb_map(c);
 }
@@ -232,9 +253,22 @@ void gb_trace_report(GB& c, const char* dir, const char* rom_path) {
     std::string d = dir;
     FILE* f = std::fopen((d + "/cov.bin").c_str(), "wb");
     if (f) { std::fwrite(t->cov.data(), 1, t->cov.size(), f); std::fclose(f); }
+    f = std::fopen((d + "/ram.bin").c_str(), "wb");
+    if (f) { std::fwrite(t->ramuse.data(), 1, t->ramuse.size(), f); std::fclose(f); }
     f = std::fopen((d + "/report.txt").c_str(), "w");
     if (!f) return;
     auto U = [](uint64_t x) { return (unsigned long long)x; };
+    {
+        // the work RAM and HRAM never touched, and the longest such run (for Pocketshift)
+        int wfree = 0, hfree = 0, best = 0, best_at = 0, run = 0;
+        for (int i = 0; i < 0x2000; i++) {
+            if (!t->ramuse[i]) { wfree++; if (++run > best) { best = run; best_at = i - run + 1; } }
+            else run = 0;
+        }
+        for (int i = 0x3F80; i < 0x3FFF; i++) hfree += !t->ramuse[i];
+        std::fprintf(f, "ram_free wram %d hram %d longest_wram %04X-%04X %d sp_min %04X\n", wfree, hfree,
+                     0xC000 + best_at, 0xC000 + best_at + best - 1, best, t->sp_min);
+    }
     std::fprintf(f, "rom %s\nsize %u cgb %d mbc %d ram %u battery %d rtc %d frames %llu jammed %d\n", rom_path, c.romsize,
                  c.cgb, c.mbc, c.sram_size, c.battery, c.has_rtc, U(c.frame), c.jammed);
     uint64_t und = 0; for (int i = 0; i < 256; i++) und += t->undefined[i];
@@ -307,7 +341,7 @@ void gb_trace_report(GB& c, const char* dir, const char* rom_path) {
         ios(s.io_w);
         std::fprintf(f, " io_r ");
         ios(s.io_r);
-        std::fprintf(f, " n %llu\n", U(s.n));
+        std::fprintf(f, " n %llu ram_w %016llX ram_r %016llX\n", U(s.n), U(s.ram_w), U(s.ram_r));
     }
     std::fprintf(f, "computed_ret %llu dropped_returns %llu\n", U(t->comp_ret), U(t->dropped));
     std::fprintf(f, "rd");
