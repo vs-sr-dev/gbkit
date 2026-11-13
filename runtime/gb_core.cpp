@@ -219,7 +219,15 @@ static void joyp_latch(GB& c, uint8_t v) {
     c.joyp = j;
 }
 
+static uint8_t io_read_hw(GB& c, uint16_t a);
+
 static uint8_t io_read(GB& c, uint16_t a) {
+    uint8_t v = io_read_hw(c, a);
+    if (c.lk && gb_lock_volatile((uint8_t)a)) gb_lock_read(c, (uint8_t)a, v);
+    return v;
+}
+
+static uint8_t io_read_hw(GB& c, uint16_t a) {
     uint8_t o = a & 0xFF;
     if (o >= 0x10 && o < 0x40) return snd_read(c, a);
     if (o >= 0x40) {
@@ -368,6 +376,7 @@ void gb_di(GB& c) { c.ime = 0; c.ei = 0; gb_recalc(c); }
 static void take_interrupt(GB& c, uint16_t at) {
     uint8_t irq = c.IE & c.IF & 0x1F;
     int n = 0; while (!(irq & (1 << n))) n++;
+    if (c.lk) gb_lock_irq(c, n);
     c.ime = 0;
     c.IF &= (uint8_t)~(1 << n);
     c.n_irq++;
@@ -420,6 +429,7 @@ static bool halt_run(GB& c) {
     c.halted = 0;
     c.PC = (uint16_t)(c.halt_at + 1);
     if (!c.ime) c.hfetch = 1;           // the byte after HALT, prefetched as it halted, runs next
+    if (c.lk) gb_lock_wake(c);
     gb_recalc(c);
     return true;
 }
@@ -433,6 +443,7 @@ void gb_halt(GB& c, uint16_t at) {
         // read twice -- the opcode fetch does not advance PC
         c.hbug = 1;
         if (c.tr) c.tr->halt_bugs++;
+        if (c.lk) gb_lock_wake(c);
         return;
     }
     gb_tick(c, 4);
@@ -541,6 +552,7 @@ static inline void wrr(GB& c, int i, uint16_t v) {
 static Step step(GB& c) {
     const uint16_t at = c.PC;
     if (c.tr) gb_trace_insn(c, at);
+    if (c.lk) gb_lock_insn(c, at);
     uint8_t op;
     if (c.hfetch) { op = gb_peek(c, at); c.hfetch = 0; c.PC++; }       // prefetched by HALT: no cycles
     else if (c.hbug) { op = gb_rd(c, at); c.hbug = 0; }               // the HALT bug: PC stays
@@ -556,7 +568,7 @@ static Step step(GB& c) {
     switch (op) {
     case 0x00: return ST_NEXT;
     case 0x01: case 0x11: case 0x21: { uint8_t lo = gb_rd(c, c.PC++); uint8_t hi = gb_rd(c, c.PC++); wrr(c, op >> 4, (uint16_t)(hi << 8 | lo)); return ST_NEXT; }
-    case 0x31: c.SP = gb_rd16(c, c.PC); c.PC += 2; return ST_NEXT;
+    case 0x31: c.SP = gb_rd16(c, c.PC); c.PC += 2; if (c.lk) gb_lock_sp(c); return ST_NEXT;
     case 0x02: gb_wr(c, GB_BC(c), c.A); return ST_NEXT;
     case 0x12: gb_wr(c, GB_DE(c), c.A); return ST_NEXT;
     case 0x22: gb_wr(c, GB_HL(c), c.A); gb_sethl(c, (uint16_t)(GB_HL(c) + 1)); return ST_NEXT;
@@ -631,7 +643,7 @@ static Step step(GB& c) {
     case 0xFA: { uint16_t a = gb_rd16(c, c.PC); c.A = gb_rd(c, a); c.PC += 2; return ST_NEXT; }
     case 0xE8: { uint8_t e = gb_rd(c, c.PC++); c.SP = gb_spe(c, e); gb_tick(c, 8); return ST_NEXT; }
     case 0xF8: { uint8_t e = gb_rd(c, c.PC++); gb_sethl(c, gb_spe(c, e)); gb_tick(c, 4); return ST_NEXT; }
-    case 0xF9: c.SP = GB_HL(c); gb_tick(c, 4); return ST_NEXT;
+    case 0xF9: c.SP = GB_HL(c); gb_tick(c, 4); if (c.lk) gb_lock_sp(c); return ST_NEXT;
     case 0xF3: gb_di(c); return ST_NEXT;
     case 0xFB: gb_ei(c); return ST_NEXT;
     case 0xCB: {

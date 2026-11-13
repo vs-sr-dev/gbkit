@@ -41,6 +41,7 @@ enum { I_VBL = 1, I_STAT = 2, I_TIMER = 4, I_SERIAL = 8, I_JOYPAD = 16 };
 enum { FZ = 0x80, FN = 0x40, FH = 0x20, FC = 0x10 };
 
 struct GBTrace;   // what the tracer measures (gb_core.cpp)
+struct GBLock;    // what Pocketshift's lockstep replays (gb_lock.cpp)
 
 struct PPU {
     uint8_t lcdc, stat, scy, scx, ly, lyc, bgp, obp0, obp1, wy, wx;
@@ -162,6 +163,7 @@ struct GB {
     // the last instructions run, native and interpreted (with GB_HISTORY)
     uint32_t hist[65536]; uint64_t htick[65536]; uint32_t hn = 0;
     GBTrace* tr = nullptr;
+    GBLock* lk = nullptr;     // --lockrec: what Pocketshift's lockstep replays (gb_lock.cpp)
     uint32_t* prof = nullptr; // --profile: interpreted instructions by (window, bank, address)
 
     // ---- what ran ----
@@ -339,6 +341,16 @@ bool gb_load(GB& c, const uint8_t* rom, uint32_t size, bool cgb, int mbc, uint32
 void gb_reset(GB& c);
 void gb_run(GB& c);                // from the reset, forever (frame_hook decides)
 bool gb_flat_frame(GB& c);         // the interpreter alone, to the next frame event
+
+// ---- --lockrec (gb_lock.cpp): the interpreter's run, for Pocketshift's lockstep ----
+bool gb_lock_open(GB& c, const char* path);
+void gb_lock_close(GB& c);
+void gb_lock_insn(GB& c, uint16_t at);           // an instruction about to run
+bool gb_lock_volatile(uint8_t reg);              // a register read the hardware's moment decides
+void gb_lock_read(GB& c, uint8_t reg, uint8_t v);
+void gb_lock_irq(GB& c, int n);                  // an interrupt about to be taken
+void gb_lock_wake(GB& c);                        // HALT left, or not entered (the HALT bug)
+void gb_lock_sp(GB& c);                          // SP set by LD SP
 uint64_t gb_hash(const GB& c);
 void gb_rgb(const GB& c, uint32_t* out);   // the 160x144 picture, 0xRRGGBB
 struct GBStop {};                  // thrown by a frame hook to end the run

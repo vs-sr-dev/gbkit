@@ -11,7 +11,7 @@ import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = os.path.join(os.path.dirname(HERE), 'runtime')
-RUNTIME_SRC = ('gb_core.cpp', 'gb_video.cpp', 'gb_sound.cpp', 'gb_trace.cpp', 'gb_main.cpp')
+RUNTIME_SRC = ('gb_core.cpp', 'gb_video.cpp', 'gb_sound.cpp', 'gb_trace.cpp', 'gb_lock.cpp', 'gb_main.cpp')
 RT_OBJ = os.path.join(os.path.dirname(HERE), 'build', 'rt_obj')
 GXX_DIR = r'C:\msys64\ucrt64\bin'
 _rt_lock = threading.Lock()

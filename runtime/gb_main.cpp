@@ -6,6 +6,8 @@
 //   gb ROM.gb --lockstep ...        native and interpreter side by side: the
 //                                   machine state compared at every frame
 //   gb ROM.gb --trace DIR ...       the interpreter, measuring for the recompiler
+//   gb ROM.gb --lockrec FILE ...    the interpreter, recording what Pocketshift's lockstep
+//                                   replays and compares (gb_lock.cpp)
 //   gb ROM.gb --window [--scale 3]  in a window, with the keyboard and sound (SDL2)
 //   gb ROM.gb --wav FILE ...        headless, the sound written to a WAV
 //   gb ROM.gb --window --record PAD ... and the pad written to PAD, a byte a frame
@@ -72,7 +74,7 @@ static uint8_t monkey(long f) {
 }
 
 struct Opts {
-    std::string rom, out = ".", wav, trace, record, replay, mbc;
+    std::string rom, out = ".", wav, trace, record, replay, mbc, lockrec;
     std::vector<std::string> peek;
     long frames = 6000;
     bool interp = false, lockstep = false, window = false, quiet = false, rtc = false, battery = false;
@@ -276,6 +278,7 @@ int main(int argc, char** argv) {
         else if (a == "--record") O.record = val();
         else if (a == "--replay") O.replay = val();
         else if (a == "--trace") O.trace = val();
+        else if (a == "--lockrec") { O.lockrec = val(); O.interp = true; }
         else if (a == "--dmg") O.model = 0;
         else if (a == "--cgb") O.model = 1;
         else if (a == "--mbc") O.mbc = val();
@@ -323,6 +326,7 @@ int main(int argc, char** argv) {
     c.frame_hook = hook_headless;
     c.snd_out = !O.wav.empty();
     if (!O.trace.empty()) gb_trace_begin(c);
+    if (!O.lockrec.empty() && !gb_lock_open(c, O.lockrec.c_str())) { std::perror(O.lockrec.c_str()); return 1; }
     if (O.lockstep) {
         gb_load(ref, rom.data(), (uint32_t)rom.size(), cgb, mbc, ram, batt, rtc);
         gb_reset(ref);
@@ -394,6 +398,7 @@ int main(int argc, char** argv) {
     write_ppm(c, O.out + "/last.ppm");
     if (!O.wav.empty()) gb_write_wav(O.wav.c_str(), g_samples.data(), g_samples.size(), SND_RATE);
     if (!O.trace.empty()) gb_trace_report(c, O.trace.c_str(), O.rom.c_str());
+    gb_lock_close(c);
     if (!O.record.empty()) {
         if (FILE* pf = std::fopen(O.record.c_str(), "wb")) {
             for (uint8_t k : g_pad) std::fputc(k, pf);

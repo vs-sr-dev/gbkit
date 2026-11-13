@@ -182,7 +182,11 @@ python -m gbkit.recomp.all "gbkit/Game Boy" --native       # ... again, those no
   nested (the fallback for whatever is not native, handing back to native
   code at every native entry) -- the tracer (`gb_trace.cpp`), and the
   executable (`gb_main.cpp`: headless, `--interp`, `--lockstep`, `--trace`,
-  `--window` with SDL2). `gb_video.cpp`: the LCD's modes (MAME's timing),
+  `--window` with SDL2), and `gb_lock.cpp`: `--lockrec FILE`, the
+  interpreter's run as Pocketshift (the Game Boy to Game Gear translator)
+  replays it -- the count of instructions run from the ROM, the reads whose
+  value is the hardware's moment (P1, DIV, IF, NR52, STAT, LY), the work RAM
+  at every interrupt, the HALTs left with IME clear. `gb_video.cpp`: the LCD's modes (MAME's timing),
   STAT and LY=LYC, the window and its line counter, ten sprites a line and
   their priorities (by X on the DMG, by OAM index on the CGB), the OAM DMA,
   the CGB's VRAM bank, attributes, palettes and HDMA, a line at a time.
