@@ -28,6 +28,7 @@ struct GBTrace {
     // HRAM a game never touches (Pocketshift puts its own state there); ram.bin
     std::vector<uint8_t> ramuse;
     uint16_t sp_min = 0xFFFF;                  // the lowest SP seen in WRAM or HRAM
+    bool irq_push = false;                     // an interrupt pushing PC: no instruction's access
     std::vector<uint8_t> ramwritten;           // ... and written after it ran (SMC)
     uint64_t ramexec_n = 0, smc_n = 0, ramexec_hram = 0, ramexec_wram = 0, ramexec_other = 0;
     // the bytes each instruction in RAM was run with (len << 24 | bytes), up to RAMVER_MAX versions

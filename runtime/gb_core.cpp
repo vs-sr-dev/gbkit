@@ -382,7 +382,10 @@ static void take_interrupt(GB& c, uint16_t at) {
     c.n_irq++;
     gb_tick(c, 12);
     c.SP -= 2;
+    // the push is not the interrupted instruction's: kept out of its site's RAM pages
+    if (c.tr) c.tr->irq_push = true;
     gb_wr(c, c.SP, (uint8_t)at); gb_wr(c, (uint16_t)(c.SP + 1), (uint8_t)(at >> 8));
+    if (c.tr) c.tr->irq_push = false;
     c.PC = (uint16_t)(0x40 + n * 8);
     if (c.tr) gb_trace_irq(c, n, at);
     gb_recalc(c);

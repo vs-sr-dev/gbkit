@@ -166,8 +166,9 @@ static inline uint8_t aclass(uint16_t a) {
 }
 
 static void site(GB& c, uint16_t a, bool w) {
-    uint8_t k = aclass(a);
     GBTrace* t = c.tr;
+    if (t->irq_push) return;
+    uint8_t k = aclass(a);
     uint16_t at = t->cur_at;
     uint32_t b = at < 0x4000 ? c.bank0 : at < 0x8000 ? c.bankx : 0xFFF;
     if (!k) {
